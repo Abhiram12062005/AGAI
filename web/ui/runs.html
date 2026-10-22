@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeFix AI · Runs</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>Runs</h1>
+  <p class="sub">Every run is a full trace: click any row to replay it.</p>
+  <div class="toolbar">
+    <select id="outcome"><option value="">All outcomes</option><option value="passed">✔ passed</option><option value="escalated">⚑ escalated</option><option value="error">✖ error</option><option value="running">◌ running</option></select>
+    <select id="arch"><option value="">All architectures</option><option>hierarchical</option><option>sequential</option><option>p2p</option></select>
+    <select id="llm"><option value="">Live + mock</option><option value="live">live only</option><option value="mock">mock only</option></select>
+    <select id="bench"><option value="">All (incl. ad-hoc)</option></select>
+    <span class="muted" id="count"></span>
+  </div>
+  <div class="card" style="overflow:auto">
+    <table>
+      <thead><tr><th>Started</th><th>Task</th><th>Arch</th><th>Outcome</th><th class="num">Attempts</th><th>Stage</th><th class="num">Time</th><th class="num">Cost</th><th>Judge</th><th>Bug</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+<script src="/app.js"></script>
+<script>
+initChrome('runs');
+const params = new URLSearchParams(location.search);
+for (const k of ['outcome', 'arch', 'llm', 'bench']) if (params.get(k)) $('#' + k).dataset.init = params.get(k);
+
+async function load() {
+  const q = new URLSearchParams();
+  if ($('#outcome').value) q.set('outcome', $('#outcome').value);
+  if ($('#arch').value) q.set('arch', $('#arch').value);
+  if ($('#llm').value) q.set('llm_mode', $('#llm').value);
+  if ($('#bench').value) q.set('bench_id', $('#bench').value);
+  const rows = await api('/api/runs?' + q);
+  $('#count').textContent = `${rows.length} runs`;
+  $('#rows').innerHTML = rows.map(r => `
+    <tr class="click" onclick="location.href='/run.html?id=${encodeURIComponent(r.task_id)}'">
+      <td class="muted">${esc(fmtTime(r.created_at))}</td><td class="mono">${esc(r.task_id)}${r.llm_mode === 'mock' ? ' <span class="chip">mock</span>' : ''}</td>
+      <td>${archChip(r.arch)}</td><td>${outcomeChip(r)}</td><td class="num">${r.attempts}/${r.max_attempts}</td>
+      <td class="muted">${esc(r.failure_stage || '')}</td><td class="num">${fmtMs(r.duration_ms)}</td><td class="num">${fmtUsd(r.cost_usd)}</td>
+      <td>${r.judge_verdict ? esc(r.judge_verdict) + (r.objective_pass == null ? '' : r.objective_pass ? ' · ✔ tests' : ' · ✖ tests') : '<span class="muted">–</span>'}</td>
+      <td>${r.bug_id ? `<span class="mono">${esc(r.bug_id)}</span>` : esc(r.bug_report)}</td></tr>`).join('')
+    || '<tr><td colspan="10" class="empty">No runs match these filters</td></tr>';
+}
+(async () => {
+  const d = await api('/api/dashboard?llm_mode=all');
+  for (const b of d.benches) $('#bench').insertAdjacentHTML('beforeend', `<option value="${esc(b.bench_id)}">${esc(b.bench_id)} (${b.n})</option>`);
+  $$('select').forEach(s => { if (s.dataset.init) s.value = s.dataset.init; s.onchange = load; });
+  load();
+})();
+</script>
+</body>
+</html>

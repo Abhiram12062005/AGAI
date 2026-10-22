@@ -1,0 +1,10 @@
+{
+  "name": "textkit",
+  "version": "0.1.0",
+  "description": "Small text utilities (slugify, truncate, camelCase, templates).",
+  "main": "src/text.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

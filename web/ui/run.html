@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeFix AI · Run</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <div id="header"></div>
+  <div class="grid">
+    <div class="card pipeline">
+      <div style="display:flex; justify-content:space-between; align-items:center">
+        <h2>Pipeline</h2>
+        <div class="legend"><span>▢ idle</span><span style="color:var(--accent)">◌ working</span><span class="status-passed">✔ success</span><span class="status-error">✖ failure</span></div>
+      </div>
+      <div id="pipeline"></div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card">
+        <h2>Diagnoser · ReAct transcript <span class="muted" id="reactCount"></span></h2>
+        <div class="transcript" id="react"><div class="empty">Waiting for the Diagnoser…</div></div>
+      </div>
+      <div class="grid" style="align-content:start">
+        <div class="card"><h2>Diagnosis</h2><div id="diagnosis"><div class="empty">–</div></div></div>
+        <div class="card"><h2>Manager decisions</h2><div id="decisions"><div class="empty">–</div></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Patch</h2>
+      <div class="tabs" id="attemptTabs"></div>
+      <div id="patch"><div class="empty">No patch yet</div></div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card"><h2>Tests</h2><div id="tests"><div class="empty">Not run yet</div></div></div>
+      <div class="card" id="outcomeCard"><h2>Outcome</h2><div id="outcome"><div class="empty">Running…</div></div></div>
+    </div>
+
+    <div class="card">
+      <h2>Agent timeline</h2>
+      <div class="chart" id="gantt"></div>
+    </div>
+
+    <div class="grid g2">
+      <div class="card"><h2>LLM calls</h2><div id="llm" style="max-height:320px; overflow:auto"></div></div>
+      <div class="card"><h2>Message log (Blackboard)</h2><div id="log" style="max-height:320px; overflow:auto"></div></div>
+    </div>
+  </div>
+</main>
+
+<div class="modal-bg" id="modalBg"><div class="modal" id="modal"></div></div>
+
+<script src="/app.js"></script>
+<script>
+initChrome('runs');
+const TASK = new URLSearchParams(location.search).get('id');
+let snap = null, selectedAttempt = null, pinnedAttempt = false, refreshTimer = null;
+
+// ---------------------------------------------------------------- pipeline diagram
+const POS = { manager: [380, 40], diagnoser: [100, 160], fixer: [290, 160], tester: [480, 160], pr: [660, 160], human: [660, 40] };
+const LABEL = { manager: ['Manager', 'routing · haiku'], diagnoser: ['Diagnoser', 'ReAct · opus'], fixer: ['Fixer', 'patch · sonnet'],
+                tester: ['Tester', 'lint + tests'], pr: ['PR agent', 'codefix/&lt;id&gt;'], human: ['Human', 'confirm / escalation'] };
+const EDGES = {
+  hierarchical: [['manager','diagnoser'],['manager','fixer'],['manager','tester'],['manager','pr'],['manager','human'],['pr','human']],
+  sequential: [['diagnoser','fixer'],['fixer','tester'],['tester','pr'],['pr','human'],['tester','diagnoser']],
+  p2p: [['diagnoser','fixer'],['fixer','tester'],['tester','pr'],['pr','human'],['tester','fixer']],
+};
+function nodeStates(s) {
+  const st = {};
+  for (const m of s.messages) {
+    if (m.status === 'dispatched' && m.target_agent !== 'human') st[m.target_agent] = 'active';
+    if (['in_progress'].includes(m.status)) st[m.sender] = 'active';
+    if (['success', 'failure'].includes(m.status)) st[m.sender] = m.status;
+  }
+  if (s.messages.some(m => m.sender === 'manager')) st.manager = s.run.status === 'running' ? 'active' : 'success';
+  if (s.run.status === 'awaiting_approval') st.human = 'active';
+  if (s.run.status === 'escalated') st.human = 'failure';
+  if (s.run.status === 'done') st.human = 'success';
+  return st;
+}
+function drawPipeline(s) {
+  const arch = s.run.arch, st = nodeStates(s);
+  const last = [...s.messages].reverse().find(m => m.status !== 'in_progress');
+  const hot = last ? [last.sender, last.target_agent] : [];
+  const W = 140, H = 50;
+  let svg = `<svg viewBox="0 0 760 210"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--axis)"/></marker></defs>`;
+  for (const [a, b] of EDGES[arch]) {
+    const [x1, y1] = POS[a], [x2, y2] = POS[b];
+    const isHot = (hot[0] === a && hot[1] === b) || (hot[0] === b && hot[1] === a);
+    const curve = (a === 'tester' && (b === 'fixer' || b === 'diagnoser'));
+    const d = curve ? `M${x1},${y1 + H / 2} C${x1},${y1 + 52} ${x2},${y2 + 52} ${x2},${y2 + H / 2}` :
+      `M${x1 + (x2 > x1 ? W / 2 : x2 < x1 ? -W / 2 : 0) * (y1 === y2 ? 1 : 0)},${y1 + (y2 > y1 ? H / 2 : y2 < y1 ? -H / 2 : 0)} L${x2 - (x2 > x1 ? W / 2 : x2 < x1 ? -W / 2 : 0) * (y1 === y2 ? 1 : 0)},${y2 - (y2 > y1 ? H / 2 : y2 < y1 ? -H / 2 : 0)}`;
+    svg += `<path class="edge ${isHot ? 'hot' : ''}" d="${d}" ${arch === 'hierarchical' ? 'marker-start="url(#arrow)"' : ''}/>`;
+  }
+  for (const [n, [x, y]] of Object.entries(POS)) {
+    const unused = arch !== 'hierarchical' && n === 'manager';
+    const state = st[n] || 'idle';
+    const icon = { active: '◌ ', success: '✔ ', failure: '✖ ' }[state] || '';
+    svg += `<g class="node ${state} ${unused ? 'unused' : ''}" data-tip="<b>${LABEL[n][0]}</b>${unused ? 'not used in ' + arch : state}">
+      <rect x="${x - W / 2}" y="${y - H / 2}" width="${W}" height="${H}"/>
+      <text x="${x}" y="${y - 2}">${icon}${LABEL[n][0]}</text><text class="sub" x="${x}" y="${y + 14}">${unused ? 'not used (' + arch + ')' : LABEL[n][1]}</text></g>`;
+  }
+  $('#pipeline').innerHTML = svg + '</svg>';
+  bindTips($('#pipeline'));
+}
+
+// ---------------------------------------------------------------- sections
+function citeChips(ids) {
+  if (!ids || !ids.length) return '<span class="muted">no citations</span>';
+  return ids.map(c => `<span class="chip cite" data-cite="${esc(c)}" title="show source">${esc(c)}</span>`).join(' ');
+}
+function renderHeader(s) {
+  const r = s.run;
+  $('#header').innerHTML = `
+    <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
+      <h1 style="margin:0">Run <span class="mono" style="font-size:18px">${esc(r.task_id)}</span></h1>
+      ${outcomeChip(r)} ${archChip(r.arch)} <span class="chip">${r.llm_mode === 'mock' ? '⚙ MOCK LLM' : 'live LLM'}</span>
+      <span class="chip">attempts ${r.attempts}/${r.max_attempts}</span>
+      <span class="chip">${fmtMs(r.duration_ms)}</span><span class="chip">${fmtUsd(r.cost_usd)}</span>
+      <a class="chip" href="/api/runs/${encodeURIComponent(r.task_id)}" target="_blank" title="Complete pipeline state at this instant">⤓ state dump</a>
+    </div>
+    <p class="sub" style="margin-top:8px"><b>Bug:</b> ${esc(r.bug_report)}<br><span class="muted">repo: ${esc(r.repo)}</span></p>
+    ${r.llm_mode === 'mock' ? '<div class="banner warn">⚠ Offline oracle mock: the agents are scripted from the seeded bug\'s ground truth to demonstrate the pipeline mechanics. The tools, workspaces, tests and Blackboard are real.</div>' : ''}`;
+}
+function renderReact(s) {
+  $('#reactCount').textContent = s.react.length ? `(${s.react.length} steps)` : '';
+  if (!s.react.length) return;
+  const box = $('#react'), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.innerHTML = s.react.map(t => `
+    <div class="step">
+      <div class="head">Step ${t.step}${t.forced ? ' · forced final' : ''}</div>
+      ${t.thinking_summary ? `<details><summary>thinking summary</summary><div class="muted">${esc(t.thinking_summary)}</div></details>` : ''}
+      <div class="thought"><b>Thought:</b> ${esc(t.thought)}</div>
+      <div><b>Action:</b> <span class="action">${esc(t.action)} ${esc(t.action_input)}</span></div>
+      ${t.observation && t.action !== 'final_answer' ? `<details><summary>Observation (${t.observation.length} chars)</summary><pre class="block">${esc(t.observation)}</pre></details>` : ''}
+    </div>`).join('');
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+function renderDiagnosis(s) {
+  const d = s.diagnosis;
+  if (!d) return;
+  $('#diagnosis').innerHTML = `
+    <p style="margin-top:0">${esc(d.root_cause)}</p>
+    <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px">
+      <span class="chip">confidence ${(d.confidence * 100).toFixed(0)}%</span>
+      ${d.degraded ? '<span class="chip">⚠ degraded (iteration cap)</span>' : ''}
+      <span class="chip">${d.react_steps} ReAct steps</span></div>
+    <div><b>Files:</b> ${d.implicated_files.map(f => `<span class="chip cite" data-cite="file:${esc(f)}">${esc(f)}</span>`).join(' ') || '–'}</div>
+    <div style="margin-top:6px"><b>Symbols:</b> ${esc(d.implicated_symbols.join(', ') || '–')}</div>
+    ${d.evidence.length ? `<div style="margin-top:6px"><b>Evidence:</b><ul style="margin:4px 0">${d.evidence.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
+    <div style="margin-top:6px"><b>Cited context:</b> ${citeChips(d.citations)}</div>`;
+}
+function renderDecisions(s) {
+  if (!s.manager_decisions.length) {
+    $('#decisions').innerHTML = `<div class="empty">${s.run.arch === 'hierarchical' ? '–' : 'No Manager in the ' + esc(s.run.arch) + ' architecture'}</div>`;
+    return;
+  }
+  $('#decisions').innerHTML = '<table><tbody>' + s.manager_decisions.map(d =>
+    `<tr><td class="muted">${esc(d.event)}</td><td><b>→ ${esc(d.decision)}</b></td><td class="muted">${esc(d.reason)}</td></tr>`).join('') + '</tbody></table>';
+}
+function renderPatch(s) {
+  if (!s.patches.length) return;
+  if (!pinnedAttempt || selectedAttempt >= s.patches.length) selectedAttempt = s.patches.length - 1;  // follow the latest unless the user picked one
+  const reports = Object.fromEntries(s.test_reports.map(r => [r.patch_artifact_id, r]));
+  $('#attemptTabs').innerHTML = s.patches.map((p, i) => {
+    const r = reports[p.id];
+    const mark = r ? (r.passed ? '✔' : '✖') : '◌';
+    return `<button class="${i === selectedAttempt ? 'on' : ''}" data-i="${i}">${mark} attempt ${p.attempt_no}</button>`;
+  }).join('');
+  $$('#attemptTabs button').forEach(b => b.onclick = () => { selectedAttempt = +b.dataset.i; pinnedAttempt = true; renderPatch(snap); renderTests(snap); });
+  const p = s.patches[selectedAttempt];
+  $('#patch').innerHTML = `
+    ${p.generation_error ? `<div class="banner warn">⚠ Fixer could not produce an applicable patch: ${esc(p.generation_error)}</div>` : ''}
+    <p style="margin-top:0"><b>Rationale:</b> ${esc(p.rationale || '–')}</p>
+    <p><b>Cited context:</b> ${citeChips(p.citations)}</p>
+    ${diffHtml(p.diff)}`;
+}
+function renderTests(s) {
+  if (!s.test_reports.length) return;
+  const p = s.patches[selectedAttempt ?? s.patches.length - 1];
+  const r = s.test_reports.find(t => p && t.patch_artifact_id === p.id) || s.test_reports[s.test_reports.length - 1];
+  const out = s.test_outputs.find(o => o.workspace === r.workspace);
+  $('#tests').innerHTML = `
+    <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px">
+      <span class="chip ${r.passed ? 'status-passed' : 'status-error'}">${r.passed ? '✔ passed' : '✖ failed'}</span>
+      <span class="chip">attempt ${r.attempt_no}</span>
+      <span class="chip">${r.total} tests · ${r.failed} failed</span>
+      ${r.failure_stage ? `<span class="chip">stage: ${esc(r.failure_stage)}</span>` : ''}
+      <span class="chip">${fmtMs(r.duration_ms)}</span><span class="chip">${r.lint_findings.length} lint findings</span></div>
+    ${r.failing_assertions.length ? `<b>Failing assertions</b><pre class="block">${esc(r.failing_assertions.join('\n'))}</pre>` : ''}
+    ${r.stack_trace ? `<details ${r.passed ? '' : 'open'}><summary>Stack trace / failure log</summary><pre class="block">${esc(r.stack_trace)}</pre></details>` : ''}
+    ${r.lint_findings.length ? `<details><summary>Lint findings</summary><pre class="block">${esc(r.lint_findings.map(f => `${f.path}:${f.line} ${f.code} ${f.message}`).join('\n'))}</pre></details>` : ''}
+    ${out ? `<details><summary>Raw test runner output (${esc(out.framework)})</summary><pre class="block">${esc(out.output)}</pre></details>` : ''}`;
+}
+function renderOutcome(s) {
+  const r = s.run;
+  let h = '';
+  if (r.status === 'running') h = '<div class="empty">◌ Running…</div>';
+  if (r.status === 'awaiting_approval') {
+    h = `<p class="status-passed"><b>✔ Tests green.</b> The verified patch is committed on <code>${esc(s.pr?.branch || 'codefix/' + r.task_id)}</code> inside an isolated workspace. <b>Nothing has been pushed.</b></p>
+         <div style="display:flex; gap:10px"><button class="primary" id="prBtn">Open Pull Request…</button><button class="btn ghost" id="declineBtn">Decline</button></div>`;
+  }
+  if (s.pr && r.status === 'done') {
+    h = `<p>${s.pr.pushed ? '✔ <b>Branch pushed.</b>' : 'ℹ'} ${esc(s.pr.note || '')}</p>${s.pr.url ? `<p><a href="${esc(s.pr.url)}" target="_blank" rel="noopener">${esc(s.pr.url)}</a></p>` : ''}`;
+  }
+  if (s.escalation) {
+    h = `<p><b>⚑ Escalated to a human</b> after ${s.escalation.attempts} attempt(s): ${esc(s.escalation.reason)}</p>
+         <pre class="block">${esc(s.escalation.summary)}</pre>
+         ${s.escalation.tried.length ? `<b>What was tried</b><ul>${s.escalation.tried.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}`;
+  }
+  if (r.status === 'error') h = `<p class="status-error"><b>✖ Run error</b></p><pre class="block">${esc(r.meta?.error || 'see trace')}</pre>`;
+  if (s.evaluation) {
+    const e = s.evaluation;
+    h += `<hr style="border:0;border-top:1px solid var(--grid)"><b>Evaluation</b><p>Judge: <b>${esc(e.verdict)}</b> (${(e.score ?? 0).toFixed(2)}) · tests in a fresh clone: ${e.objective_pass ? '✔ green' : '✖ red'}
+          · ${e.agreement == null ? '' : e.agreement ? 'judge agrees with tests' : 'judge disagrees with tests'}</p><p class="muted">${esc(e.reasoning)}</p>`;
+  }
+  $('#outcome').innerHTML = h;
+  if ($('#prBtn')) $('#prBtn').onclick = () => prModal(s);
+  if ($('#declineBtn')) $('#declineBtn').onclick = async () => { await api(`/api/runs/${TASK}/pr`, { method: 'POST', body: JSON.stringify({ confirm: false }) }); refresh(); };
+}
+function renderTables(s) {
+  $('#llm').innerHTML = s.llm_calls.length ? `<table><thead><tr><th>Agent</th><th>Model</th><th class="num">In</th><th class="num">Out</th><th class="num">Cost</th><th class="num">Latency</th></tr></thead><tbody>${
+    s.llm_calls.map(c => `<tr><td>${esc(c.agent)}</td><td class="mono">${esc(c.served_model || c.model)}${c.error ? ' ⚠' : ''}</td><td class="num">${c.input_tokens}</td><td class="num">${c.output_tokens}</td><td class="num">${fmtUsd(c.cost_usd)}</td><td class="num">${fmtMs(c.latency_ms)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">–</div>';
+  $('#log').innerHTML = `<table><thead><tr><th>#</th><th>From → To</th><th>Status</th><th>Payload</th><th class="num">Latency</th><th class="num">Δ</th></tr></thead><tbody>${
+    s.messages.map(m => `<tr><td class="muted">${m.id}</td><td>${esc(m.sender)} → ${esc(m.target_agent)}</td><td>${esc(m.status)}</td><td class="mono">${esc(m.kind)}${m.artifact_id ? ' ' + esc(m.artifact_id) : ''}</td><td class="num">${fmtMs(m.latency_ms)}</td><td class="num muted">${fmtMs(m.delta_ms)}</td></tr>`).join('')}</tbody></table>`;
+  const mgr = s.llm_calls.filter(c => c.agent === 'manager').map(c => ({ agent: 'manager', start: new Date(Date.parse(c.timestamp) - c.latency_ms).toISOString(), end: c.timestamp, status: 'success', kind: 'routing call' }));
+  gantt($('#gantt'), s.spans, mgr);
+}
+
+// ---------------------------------------------------------------- modals
+function modal(html) { $('#modal').innerHTML = html; $('#modalBg').style.display = 'grid'; }
+function closeModal() { $('#modalBg').style.display = 'none'; }
+$('#modalBg').onclick = e => { if (e.target.id === 'modalBg') closeModal(); };
+
+function prModal(s) {
+  const branch = s.pr?.branch || `codefix/${s.run.task_id}`;
+  modal(`<h3>Open a Pull Request?</h3>
+    <p>This will <b>push</b> branch <code>${esc(branch)}</code> to the target repo's <code>origin</code> remote and open a PR against its default branch. It never pushes to the default branch itself.</p>
+    <label style="text-transform:none; font-size:13px; display:flex; gap:8px; align-items:center"><input type="checkbox" id="ack" style="width:auto"> I reviewed the diff and the test results</label>
+    <div class="actions"><button class="btn ghost" id="cancel">Cancel</button><button class="primary" id="confirm" disabled>Push &amp; open PR</button></div>
+    <p id="prErr" class="status-error"></p>`);
+  $('#ack').onchange = () => $('#confirm').disabled = !$('#ack').checked;
+  $('#cancel').onclick = closeModal;
+  $('#confirm').onclick = async () => {
+    $('#confirm').disabled = true; $('#confirm').textContent = 'Pushing…';
+    try { await api(`/api/runs/${TASK}/pr`, { method: 'POST', body: JSON.stringify({ confirm: true }) }); closeModal(); refresh(); }
+    catch (e) { $('#prErr').textContent = e.message; $('#confirm').textContent = 'Push & open PR'; }
+  };
+}
+document.addEventListener('click', async e => {
+  const c = e.target.closest('[data-cite]');
+  if (!c) return;
+  const id = c.dataset.cite;
+  let m = id.match(/^(?:code|docs):(.+):(\d+)-(\d+)$/), path, start = 1, end = 60;
+  if (m) [, path, start, end] = [0, m[1], +m[2], +m[3]];
+  else if (id.startsWith('file:')) path = id.slice(5);
+  else { modal(`<h3>${esc(id)}</h3><p>Past accepted fix from this project's run history (RAG collection <code>bugs</code>).</p><div class="actions"><button class="btn ghost" onclick="closeModal()">Close</button></div>`); return; }
+  try {
+    const src = await api(`/api/runs/${TASK}/source?path=${encodeURIComponent(path)}&start=${start}&end=${end}`);
+    modal(`<h3 class="mono" style="font-size:14px">${esc(src.path)}:${src.start}-${src.end}</h3><pre class="block">${src.lines.map((l, i) => `${String(src.start + i).padStart(4)}  ${esc(l)}`).join('\n')}</pre><div class="actions"><button class="btn ghost" onclick="closeModal()">Close</button></div>`);
+  } catch (err) { modal(`<p class="status-error">${esc(err.message)}</p><div class="actions"><button class="btn ghost" onclick="closeModal()">Close</button></div>`); }
+});
+
+// ---------------------------------------------------------------- live updates
+async function refresh() {
+  snap = await api(`/api/runs/${encodeURIComponent(TASK)}`);
+  renderHeader(snap); drawPipeline(snap); renderReact(snap); renderDiagnosis(snap); renderDecisions(snap);
+  renderPatch(snap); renderTests(snap); renderOutcome(snap); renderTables(snap);
+}
+function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 250); }
+
+(async () => {
+  if (!TASK) { $('#header').innerHTML = '<div class="empty">No run id</div>'; return; }
+  await refresh();
+  if (snap.run.status === 'running') {
+    const es = new EventSource(`/api/runs/${encodeURIComponent(TASK)}/events`);
+    es.onmessage = () => scheduleRefresh();
+    es.addEventListener('done', () => { es.close(); refresh(); });
+    es.onerror = () => { es.close(); setTimeout(refresh, 1500); };
+  }
+})();
+</script>
+</body>
+</html>

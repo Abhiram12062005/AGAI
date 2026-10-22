@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeFix AI · Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>Dashboard</h1>
+  <p class="sub">Which agent is the bottleneck, and where accuracy breaks down, across every logged run.</p>
+  <div class="toolbar">
+    <select id="mode"><option value="live">Live LLM runs</option><option value="mock">Mock runs</option><option value="all">All runs</option></select>
+    <select id="bench"><option value="">All runs (incl. ad-hoc)</option></select>
+    <span class="muted" id="scope"></span>
+  </div>
+  <div id="mockBanner"></div>
+
+  <div class="grid g6" id="kpis"></div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="card"><h2>⏱ Bottleneck: mean latency per agent</h2><p class="muted" id="bottleneckText" style="margin-top:-6px"></p><div class="chart" id="latency"></div></div>
+    <div class="card"><h2>🎯 Accuracy weak point (seeded bugs)</h2><p class="muted" id="weakText" style="margin-top:-6px"></p>
+      <div class="legend" id="weakLegend"></div><div class="chart" id="weak"></div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="card"><h2>Architecture comparison</h2><div class="legend" id="archLegend"></div><div class="chart" id="archChart"></div>
+      <details style="margin-top:8px"><summary class="muted">Table view</summary><div id="archTable"></div></details></div>
+    <div class="card"><h2>Failure-stage breakdown (non-passing runs)</h2><div class="chart" id="stages"></div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="card"><h2>Fixer attempts per run</h2><div class="legend" id="attLegend"></div><div class="chart" id="attempts"></div></div>
+    <div class="card"><h2>Cost per run</h2><div class="legend" id="costLegend"></div><div class="chart" id="cost"></div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:16px">
+    <div class="card"><h2>Judge vs. objective tests</h2><div id="confusion"></div></div>
+    <div class="card"><h2>Spend by agent / model</h2><div id="agentCost"></div></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
+      <h2 style="margin:0">Per-run timeline</h2>
+      <select id="runPick" style="width:auto; max-width:100%"></select>
+    </div>
+    <div class="chart" id="gantt" style="margin-top:10px"></div>
+  </div>
+</main>
+<script src="/app.js"></script>
+<script>
+initChrome('dash');
+const ARCH_COLOR = { hierarchical: 'var(--series-1)', sequential: 'var(--series-2)', p2p: 'var(--series-3)' };
+const pct = (a, b) => b ? Math.round(100 * a / b) : 0;
+const mean = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
+const legend = archs => archs.map(a => `<span><i style="background:${ARCH_COLOR[a]}"></i>${a}</span>`).join('');
+
+function kpi(label, value, hint = '') { return `<div class="card kpi"><div class="label">${label}</div><div class="value">${value}</div><div class="hint">${hint}</div></div>`; }
+
+async function load() {
+  const q = new URLSearchParams({ llm_mode: $('#mode').value });
+  if ($('#bench').value) q.set('bench_id', $('#bench').value);
+  const d = await api('/api/dashboard?' + q);
+  const runs = d.runs.filter(r => r.status !== 'running');
+  $('#scope').textContent = `${runs.length} finished runs`;
+  $('#mockBanner').innerHTML = $('#mode').value !== 'live' ? '<div class="banner warn">⚠ Includes mock (offline oracle) runs: they validate the pipeline mechanics, not model quality.</div>' : '';
+  const archs = Object.keys(ARCH_COLOR).filter(a => runs.some(r => r.arch === a));
+
+  // ---- KPIs
+  const passed = runs.filter(r => r.outcome === 'passed').length;
+  const judged = runs.filter(r => r.agreement != null);
+  $('#kpis').innerHTML = [
+    kpi('Runs', runs.length, `${archs.length} architectures`),
+    kpi('Resolved', `${pct(passed, runs.length)}%`, `${passed} passed · ${runs.filter(r => r.outcome === 'escalated').length} escalated`),
+    kpi('Judge accuracy', judged.length ? `${pct(judged.filter(r => r.agreement).length, judged.length)}%` : '–', `agreement with tests (${judged.length} judged)`),
+    kpi('Mean attempts', mean(runs.map(r => r.attempts)).toFixed(2), `${runs.filter(r => r.attempts > 1).length} runs retried`),
+    kpi('Mean cost / run', fmtUsd(mean(runs.map(r => r.cost_usd))), `total ${fmtUsd(runs.reduce((a, r) => a + r.cost_usd, 0))}`),
+    kpi('Mean duration', fmtMs(Math.round(mean(runs.map(r => r.duration_ms || 0)))), 'wall-clock per run'),
+  ].join('');
+
+  // ---- bottleneck
+  const lat = d.agent_latency.map(a => ({ label: a.agent, value: (a.mean_ms || 0) / 1000,
+    tip: `<b>${a.agent}</b>mean ${fmtMs(Math.round(a.mean_ms))} · max ${fmtMs(a.max_ms)} · ${a.n} completions · ${a.failures} failures` }))
+    .sort((a, b) => b.value - a.value);
+  hbar($('#latency'), lat.map(l => ({ ...l, color: AGENT_COLOR[l.label] })), { fmt: v => `${v.toFixed(1)}s`, highlight: 0, note: 'bottleneck' });
+  $('#bottleneckText').textContent = lat.length ? `${lat[0].label} accounts for the most time per completion (${lat[0].value.toFixed(1)} s mean).` : '';
+
+  // ---- accuracy weak point: localisation (Diagnoser) vs repair given correct localisation (Fixer)
+  const weakArchs = archs.filter(a => d.localisation[a]);
+  $('#weakLegend').innerHTML = legend(weakArchs);
+  vgroups($('#weak'), [
+    { label: 'Diagnoser: right file', values: weakArchs.map(a => ({ key: a, value: pct(d.localisation[a].hit, d.localisation[a].n), color: ARCH_COLOR[a] })) },
+    { label: 'Fixer: resolved | right file', values: weakArchs.map(a => ({ key: a, value: pct(d.repair_given_located[a]?.hit || 0, d.repair_given_located[a]?.n || 0), color: ARCH_COLOR[a] })) },
+  ].filter(g => g.values.length), weakArchs, { fmt: v => `${Math.round(v)}%`, maxV: 100 });
+  const locAll = Object.values(d.localisation).reduce((a, v) => [a[0] + v.hit, a[1] + v.n], [0, 0]);
+  const repAll = Object.values(d.repair_given_located).reduce((a, v) => [a[0] + v.hit, a[1] + v.n], [0, 0]);
+  $('#weakText').textContent = locAll[1] ? `Localisation ${pct(...locAll)}% vs repair-given-localisation ${pct(...repAll)}% → ${pct(...locAll) === pct(...repAll) ? 'no single weak point (tied)' : 'weak point: ' + (pct(...locAll) < pct(...repAll) ? 'Diagnoser (finding the bug)' : 'Fixer (writing the fix)')}.` : 'Run the benchmark to populate.';
+
+  // ---- architecture comparison
+  const stats = archs.map(a => {
+    const rs = runs.filter(r => r.arch === a), j = rs.filter(r => r.agreement != null);
+    return { a, n: rs.length, resolved: pct(rs.filter(r => r.outcome === 'passed').length, rs.length),
+      judgePass: pct(rs.filter(r => r.verdict === 'pass').length, rs.filter(r => r.verdict).length),
+      judgeAcc: pct(j.filter(r => r.agreement).length, j.length), attempts: mean(rs.map(r => r.attempts)),
+      cost: mean(rs.map(r => r.cost_usd)), dur: mean(rs.map(r => r.duration_ms || 0)) };
+  });
+  $('#archLegend').innerHTML = legend(archs);
+  vgroups($('#archChart'), [['Resolved %', 'resolved'], ['Judge pass %', 'judgePass'], ['Judge accuracy %', 'judgeAcc']].map(([label, k]) => ({
+    label, values: stats.map(s => ({ key: s.a, value: s[k], color: ARCH_COLOR[s.a] })) })), archs, { fmt: v => `${Math.round(v)}%`, maxV: 100 });
+  $('#archTable').innerHTML = `<table><thead><tr><th>Arch</th><th class="num">Runs</th><th class="num">Resolved</th><th class="num">Judge pass</th><th class="num">Judge acc.</th><th class="num">Attempts</th><th class="num">Cost</th><th class="num">Duration</th></tr></thead><tbody>${
+    stats.map(s => `<tr><td>${archChip(s.a)}</td><td class="num">${s.n}</td><td class="num">${s.resolved}%</td><td class="num">${s.judgePass}%</td><td class="num">${s.judgeAcc}%</td><td class="num">${s.attempts.toFixed(2)}</td><td class="num">${fmtUsd(s.cost)}</td><td class="num">${fmtMs(Math.round(s.dur))}</td></tr>`).join('')}</tbody></table>`;
+
+  // ---- failure stages
+  const stageCounts = {};
+  runs.filter(r => r.outcome !== 'passed').forEach(r => { const k = r.failure_stage || r.outcome || 'unknown'; stageCounts[k] = (stageCounts[k] || 0) + 1; });
+  hbar($('#stages'), Object.entries(stageCounts).sort((a, b) => b[1] - a[1]).map(([label, value]) => ({ label, value, color: 'var(--series-1)' })), { fmt: v => Math.round(v) });
+
+  // ---- attempts distribution
+  const maxAtt = Math.max(1, ...runs.map(r => r.attempts));
+  $('#attLegend').innerHTML = legend(archs);
+  vgroups($('#attempts'), Array.from({ length: maxAtt }, (_, i) => ({ label: `${i + 1} attempt${i ? 's' : ''}`,
+    values: archs.map(a => ({ key: a, value: runs.filter(r => r.arch === a && r.attempts === i + 1).length, color: ARCH_COLOR[a] })) })), archs, { fmt: v => Math.round(v) });
+
+  // ---- cost per run (columns in run order, colour = architecture)
+  $('#costLegend').innerHTML = legend(archs);
+  costColumns($('#cost'), runs);
+
+  // ---- judge confusion
+  const cm = {};
+  runs.filter(r => r.verdict).forEach(r => { const k = `${r.verdict}|${r.objective_pass ? 'green' : 'red'}`; cm[k] = (cm[k] || 0) + 1; });
+  const verdicts = ['pass', 'partial', 'fail', 'error'].filter(v => cm[`${v}|green`] || cm[`${v}|red`]);
+  $('#confusion').innerHTML = verdicts.length ? `<table><thead><tr><th>Judge verdict</th><th class="num">✔ tests green</th><th class="num">✖ tests red</th></tr></thead><tbody>${
+    verdicts.map(v => `<tr><td>${v}</td><td class="num">${cm[v + '|green'] || 0}</td><td class="num">${cm[v + '|red'] || 0}</td></tr>`).join('')}</tbody></table>
+    <p class="muted">Agreement = (pass ∧ green) + (¬pass ∧ red). The judge never sees test results.</p>` : '<div class="empty">No judged runs yet (run <code>codefix bench</code>)</div>';
+
+  // ---- spend by agent
+  $('#agentCost').innerHTML = d.agent_cost.length ? `<table><thead><tr><th>Agent</th><th>Model</th><th class="num">Calls</th><th class="num">Tokens in/out</th><th class="num">Cost</th></tr></thead><tbody>${
+    d.agent_cost.sort((a, b) => b.cost - a.cost).map(c => `<tr><td>${esc(c.agent)}</td><td class="mono">${esc(c.model)}</td><td class="num">${c.calls}</td><td class="num">${c.inp}/${c.outp}</td><td class="num">${fmtUsd(c.cost)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">–</div>';
+
+  // ---- per-run gantt
+  const picks = [...runs].reverse();
+  $('#runPick').innerHTML = picks.map(r => `<option value="${esc(r.task_id)}">${esc(r.task_id)} · ${esc(r.arch)} · ${esc(r.bug_id || '')} · ${esc(r.outcome || '')}</option>`).join('');
+  $('#runPick').onchange = showGantt;
+  showGantt();
+}
+
+function costColumns(el, runs) {
+  if (!runs.length) { el.innerHTML = '<div class="empty">No data yet</div>'; return; }
+  const W = 560, H = 200, left = 46, bottom = 18, top = 8;
+  const max = Math.max(...runs.map(r => r.cost_usd), 1e-6);
+  const bw = Math.max(2, (W - left) / runs.length - 2);
+  const y = v => top + (H - top - bottom) * (1 - v / max);
+  let s = `<svg viewBox="0 0 ${W} ${H}">`;
+  [0, 0.5, 1].forEach(f => s += `<line class="gridline" x1="${left}" x2="${W}" y1="${y(f * max)}" y2="${y(f * max)}"/><text x="${left - 6}" y="${y(f * max) + 4}" text-anchor="end">${fmtUsd(f * max)}</text>`);
+  runs.forEach((r, i) => {
+    const x = left + i * (bw + 2), by = y(r.cost_usd), h = H - bottom - by;
+    s += `<rect class="bar" x="${x}" y="${by}" width="${bw}" height="${Math.max(h, 1)}" rx="${Math.min(4, bw / 2)}" fill="${ARCH_COLOR[r.arch]}"
+      data-tip="<b>${esc(r.task_id)}</b>${esc(r.arch)} · ${esc(r.bug_id || '')}<br>${fmtUsd(r.cost_usd)} · ${esc(r.outcome || '')}"/>`;
+  });
+  el.innerHTML = s + `<line class="axis" x1="${left}" x2="${W}" y1="${H - bottom}" y2="${H - bottom}"/></svg>`;
+  bindTips(el);
+}
+
+async function showGantt() {
+  const id = $('#runPick').value;
+  if (!id) { $('#gantt').innerHTML = '<div class="empty">No runs</div>'; return; }
+  const s = await api(`/api/runs/${encodeURIComponent(id)}`);
+  const mgr = s.llm_calls.filter(c => c.agent === 'manager').map(c => ({ agent: 'manager', start: new Date(Date.parse(c.timestamp) - c.latency_ms).toISOString(), end: c.timestamp, status: 'success', kind: 'routing call' }));
+  gantt($('#gantt'), s.spans, mgr);
+}
+
+(async () => {
+  const d = await api('/api/dashboard?llm_mode=all');
+  for (const b of d.benches) $('#bench').insertAdjacentHTML('beforeend', `<option value="${esc(b.bench_id)}">${esc(b.bench_id)} · ${b.n} runs · ${esc(b.llm_mode)}</option>`);
+  if (!d.runs.some(r => r.llm_mode === 'live') && d.runs.length) $('#mode').value = 'all';
+  $('#mode').onchange = load; $('#bench').onchange = load;
+  load();
+})();
+</script>
+</body>
+</html>

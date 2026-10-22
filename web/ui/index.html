@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeFix AI · New fix</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>New fix</h1>
+  <p class="sub">Paste a bug report and point at a Git repo. The Manager delegates to the Diagnoser, Fixer and Tester; failing tests send the Fixer back with the log attached. Nothing is pushed without your confirmation.</p>
+  <div id="keyBanner"></div>
+  <div class="grid g2">
+    <form class="card" id="form">
+      <h2>Bug</h2>
+      <label for="seed">Seeded demo bug (optional)</label>
+      <select id="seed"><option value="">— custom bug on my own repo —</option></select>
+
+      <label for="report">Bug report</label>
+      <textarea id="report" placeholder="Checkout crashes with KeyError: 'CA' for California customers…" required></textarea>
+
+      <label for="trace">Stack trace / failing test output (optional)</label>
+      <textarea id="trace" class="mono" placeholder="Traceback (most recent call last): …"></textarea>
+
+      <label for="repo">Repository path</label>
+      <input id="repo" placeholder="C:\path\to\repo  (a local git checkout)">
+
+      <div class="row">
+        <div>
+          <label for="arch">Architecture</label>
+          <select id="arch">
+            <option value="hierarchical">hierarchical (Manager + Blackboard)</option>
+            <option value="sequential">sequential (restart on failure)</option>
+            <option value="p2p">p2p (direct hand-offs)</option>
+          </select>
+        </div>
+        <div>
+          <label for="attempts">Retry limit</label>
+          <select id="attempts"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+        </div>
+        <div>
+          <label for="llm">LLM</label>
+          <select id="llm"><option value="live">live (Anthropic API)</option><option value="mock">mock (offline oracle, seeded bugs)</option></select>
+        </div>
+      </div>
+      <div style="margin-top:18px; display:flex; gap:12px; align-items:center">
+        <button class="primary" id="run" type="submit">▶ Run</button>
+        <span id="err" class="status-error"></span>
+      </div>
+    </form>
+
+    <div class="grid" style="align-content:start">
+      <div class="card">
+        <h2>Models (config/models.yaml)</h2>
+        <table id="models"><thead><tr><th>Agent</th><th>Model</th><th>Effort</th></tr></thead><tbody></tbody></table>
+        <p class="muted" style="margin:10px 0 0">The judge must differ from the Diagnoser and the Fixer; this is enforced when the config loads.</p>
+      </div>
+      <div class="card">
+        <h2>Pipeline</h2>
+        <img src="/graph.png" alt="Compiled LangGraph: manager routes to diagnoser, fixer, tester, pr_prepare or escalate; workers return to manager; open_pr is interrupted for human confirmation" style="width:100%; background:#fff; border-radius:8px">
+      </div>
+    </div>
+  </div>
+</main>
+<script src="/app.js"></script>
+<script>
+initChrome('new');
+let cfg;
+(async () => {
+  cfg = await api('/api/config');
+  if (!cfg.has_api_key) {
+    $('#keyBanner').innerHTML = `<div class="banner warn">⚠ <b>No ANTHROPIC_API_KEY set.</b> Live runs are disabled. Add it to <code>.env</code>, or pick a seeded bug with the <b>mock</b> LLM for an offline demo.</div>`;
+    $('#llm').value = 'mock';
+  }
+  for (const b of cfg.bugs) $('#seed').insertAdjacentHTML('beforeend', `<option value="${esc(b.id)}">${esc(b.id)} · ${esc(b.repo)} · ${esc(b.difficulty)}</option>`);
+  $('#models tbody').innerHTML = Object.entries(cfg.models).map(([r, m]) => `<tr><td>${esc(r)}</td><td class="mono">${esc(m.model)}</td><td>${esc(m.effort || '–')}</td></tr>`).join('');
+  $('#attempts').value = String(cfg.pipeline.max_attempts);
+})();
+
+$('#seed').onchange = () => {
+  const b = cfg.bugs.find(x => x.id === $('#seed').value);
+  $('#report').value = b ? b.report : '';
+  $('#repo').value = b ? `(fresh copy of benchmarks/bugset/repos/${b.repo} with ${b.id} injected)` : '';
+  $('#repo').disabled = !!b;
+  $('#trace').placeholder = b ? 'The failing test output is captured automatically for seeded bugs' : 'Traceback (most recent call last): …';
+};
+
+$('#form').onsubmit = async e => {
+  e.preventDefault();
+  $('#err').textContent = '';
+  $('#run').disabled = true;
+  try {
+    const seed = $('#seed').value || null;
+    const { task_id } = await api('/api/runs', { method: 'POST', body: JSON.stringify({
+      bug_report: $('#report').value, repo: seed ? '' : $('#repo').value, stack_trace: $('#trace').value,
+      arch: $('#arch').value, max_attempts: +$('#attempts').value, llm: $('#llm').value, bug_id: seed }) });
+    location.href = `/run.html?id=${encodeURIComponent(task_id)}`;
+  } catch (err) {
+    $('#err').textContent = err.message;
+    $('#run').disabled = false;
+  }
+};
+</script>
+</body>
+</html>

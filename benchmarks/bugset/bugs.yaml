@@ -1,0 +1,234 @@
+# Seeded bug set. Each bug is injected into a pristine copy of a sample repo by exact
+# find/replace edits; the known-good fix is the reverse edit. `failing_test` must fail after
+# injection and pass after the fix (verified by `codefix bench --verify-bugset`).
+#
+#   with_trace: the benchmark runs the failing test and attaches its real output as the
+#               stack trace (otherwise the agent only gets the prose bug report).
+#   root_cause: ground truth, used ONLY by the offline oracle mock (--llm mock), never shown
+#               to live agents or the judge.
+
+bugs:
+  - id: py01-subtotal-skips-last
+    repo: pyshop
+    difficulty: easy
+    with_trace: false
+    failing_test: tests/test_cart.py::test_subtotal_sums_all_lines
+    inject:
+      - file: pyshop/cart.py
+        find: "for i in range(len(self.items)):"
+        replace: "for i in range(len(self.items) - 1):"
+    report: >
+      Cart subtotal is wrong when the cart holds several different products. With 2 mugs
+      ($12.50 each), 1 lamp ($39.99) and 3 pens ($1.00 each) the subtotal shows $64.99,
+      but it should be $67.99.
+    root_cause: Cart.subtotal iterates range(len(items) - 1) and skips the last line item.
+
+  - id: py02-discount-returns-discount
+    repo: pyshop
+    difficulty: easy
+    with_trace: true
+    failing_test: tests/test_pricing.py::test_apply_discount
+    inject:
+      - file: pyshop/pricing.py
+        find: "return to_money(Decimal(str(amount)) - percent_of(amount, pct))"
+        replace: "return to_money(percent_of(amount, pct))"
+    report: >
+      apply_discount(100, 15) returns 15.00 but it should return the discounted price 85.00.
+      Every bulk-discounted line in the cart is now priced at the discount amount.
+    root_cause: apply_discount returns percent_of(amount, pct) (the discount) instead of amount minus the discount.
+
+  - id: py03-rounding-truncates
+    repo: pyshop
+    difficulty: medium
+    with_trace: true
+    failing_test: tests/test_money.py::test_to_money_rounds_half_up
+    inject:
+      - file: pyshop/money.py
+        find: "return Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)"
+        replace: "return Decimal(str(value)).quantize(CENT, rounding=\"ROUND_DOWN\")"
+    report: >
+      Totals are sometimes one cent short. to_money("2.345") gives 2.34 and tax on 19.99 at
+      7.25% comes out as 1.44. Our pricing rule is to round to cents half-up.
+    root_cause: to_money quantizes with ROUND_DOWN instead of ROUND_HALF_UP.
+
+  - id: py04-reserve-exact-stock
+    repo: pyshop
+    difficulty: easy
+    with_trace: true
+    failing_test: tests/test_inventory.py::test_reserve_exact_remaining_quantity
+    inject:
+      - file: pyshop/inventory.py
+        find: "if self.available(sku) >= qty:"
+        replace: "if self.available(sku) > qty:"
+    report: >
+      Customers cannot buy the last units of a product. Reserving 3 units when exactly 3 are
+      available raises OutOfStock.
+    root_cause: Inventory.reserve compares available > qty instead of available >= qty.
+
+  - id: py05-region-case
+    repo: pyshop
+    difficulty: medium
+    with_trace: true
+    failing_test: tests/test_pricing.py::test_tax_region_case_insensitive
+    inject:
+      - file: pyshop/pricing.py
+        find: "return region.strip().lower()"
+        replace: "return region.strip()"
+    report: >
+      Checkout crashes with KeyError: 'CA' for California customers. Lower-case "ca" works.
+    root_cause: normalize_region no longer lower-cases the region, so TAX_RATES lookup fails for upper-case codes.
+
+  - id: py06-free-shipping-threshold
+    repo: pyshop
+    difficulty: medium
+    with_trace: false
+    failing_test: tests/test_cart.py::test_order_total_free_shipping_uses_discounted_subtotal
+    inject:
+      - file: pyshop/cart.py
+        find: "if discounted >= FREE_SHIPPING_THRESHOLD or not cart.items"
+        replace: "if subtotal >= FREE_SHIPPING_THRESHOLD or not cart.items"
+    report: >
+      Orders that drop below $50 after applying a promo code still get free shipping. A $50.00
+      cart with SPRING10 (=> $45.00) should be charged $5.99 shipping.
+    root_cause: order_total checks the free-shipping threshold against the pre-discount subtotal instead of the discounted subtotal.
+
+  - id: py07-promo-end-inclusive
+    repo: pyshop
+    difficulty: medium
+    with_trace: true
+    failing_test: tests/test_pricing.py::test_promo_window_start_inclusive_end_exclusive
+    inject:
+      - file: pyshop/pricing.py
+        find: "if promo[\"start\"] <= today < promo[\"end\"]:"
+        replace: "if promo[\"start\"] <= today <= promo[\"end\"]:"
+    report: >
+      The SPRING10 promo code is still accepted on June 1st 2026, the day it was supposed to end.
+    root_cause: promo_pct treats the promo end date as inclusive (<=) although it is exclusive.
+
+  - id: py08-mutable-default
+    repo: pyshop
+    difficulty: hard
+    with_trace: true
+    failing_test: tests/test_reports.py::test_tag_orders_fresh_list_each_call
+    inject:
+      - file: pyshop/reports.py
+        find: "def tag_orders(orders: list[dict], tag: str, existing: list | None = None) -> list[str]:"
+        replace: "def tag_orders(orders: list[dict], tag: str, existing: list = []) -> list[str]:"
+      - file: pyshop/reports.py
+        find: "result = existing if existing is not None else []"
+        replace: "result = existing"
+    report: >
+      tag_orders returns order ids from earlier calls. Calling it for "gift" and then for
+      "rush" returns ['o1', 'o3', 'o3'] for the second call instead of ['o3'].
+    root_cause: tag_orders uses a mutable default argument (existing=[]) that is shared and mutated across calls.
+
+  - id: py09-snapshot-aliasing
+    repo: pyshop
+    difficulty: medium
+    with_trace: false
+    failing_test: tests/test_inventory.py::test_snapshot_is_a_copy
+    inject:
+      - file: pyshop/inventory.py
+        find: "return {sku: self.available(sku) for sku in self._stock}"
+        replace: "snapshot = self._stock
+        return snapshot"
+    report: >
+      Modifying the dict returned by Inventory.snapshot() changes the real stock levels of
+      the inventory. Reports code mutates the snapshot and stock goes wrong afterwards.
+    root_cause: Inventory.snapshot returns the internal _stock dict itself instead of a fresh dict of available quantities.
+
+  - id: py10-bulk-tier-boundary
+    repo: pyshop
+    difficulty: easy
+    with_trace: true
+    failing_test: "tests/test_pricing.py::test_bulk_discount_tiers"
+    inject:
+      - file: pyshop/pricing.py
+        find: "if quantity >= 50:"
+        replace: "if quantity > 50:"
+    report: >
+      Ordering exactly 50 units only gives the 5% bulk discount instead of 10%.
+    root_cause: bulk_discount_pct uses quantity > 50 for the 10% tier instead of quantity >= 50.
+
+  - id: py11-sku-dashes
+    repo: pyshop
+    difficulty: hard
+    with_trace: true
+    failing_test: tests/test_catalog.py::test_get_is_case_and_dash_insensitive
+    inject:
+      - file: pyshop/catalog.py
+        find: "return sku.strip().upper().replace(\"-\", \"\")"
+        replace: "return sku.strip().upper()"
+    report: >
+      catalog.get("ab-100") works but catalog.get("AB100") raises KeyError: unknown sku AB100.
+      Carts also fail with OutOfStock for products that are in stock. SKUs are supposed to
+      ignore dashes.
+    root_cause: normalize_sku no longer strips dashes, so dashed and undashed SKUs map to different keys.
+
+  - id: py12-split-leftover
+    repo: pyshop
+    difficulty: medium
+    with_trace: true
+    failing_test: tests/test_money.py::test_split_evenly_sums_exactly
+    inject:
+      - file: pyshop/money.py
+        find: "return [Decimal(base + (1 if i < extra else 0)) / 100 for i in range(parts)]"
+        replace: "return [Decimal(base + (1 if i <= extra else 0)) / 100 for i in range(parts)]"
+    report: >
+      split_evenly(Decimal("10.00"), 3) returns shares that add up to 10.01 instead of 10.00.
+    root_cause: split_evenly gives an extra cent to shares with i <= extra (one too many) instead of i < extra.
+
+  - id: js01-slugify-global
+    repo: textkit
+    difficulty: easy
+    with_trace: true
+    failing_test: "slugify joins every word with dashes"
+    inject:
+      - file: src/text.js
+        find: ".replace(/[\\s-]+/g, '-')"
+        replace: ".replace(/[\\s-]+/, '-')"
+    report: >
+      slugify("Hello Big  World!") returns "hello-big  world" — only the first gap becomes a
+      dash.
+    root_cause: The whitespace/dash replacement regex in slugify lost its global flag, so only the first run is replaced.
+
+  - id: js02-truncate-length
+    repo: textkit
+    difficulty: easy
+    with_trace: true
+    failing_test: "truncate keeps total length within max including ellipsis"
+    inject:
+      - file: src/text.js
+        find: "return text.slice(0, max - ellipsis.length) + ellipsis;"
+        replace: "return text.slice(0, max) + ellipsis;"
+    report: >
+      truncate("abcdefghij", 8) returns an 11-character string; the result must never be
+      longer than max, ellipsis included.
+    root_cause: truncate slices max characters and then appends the ellipsis instead of slicing max - ellipsis.length.
+
+  - id: js03-template-falsy
+    repo: textkit
+    difficulty: medium
+    with_trace: true
+    failing_test: "render keeps falsy-but-present values"
+    inject:
+      - file: src/template.js
+        find: "if (value === undefined || value === null) {"
+        replace: "if (!value) {"
+    report: >
+      Templates drop zero values: "{{count}} items" with count = 0 renders " items", and
+      done=false renders as empty.
+    root_cause: render treats every falsy value as missing (!value) instead of only undefined/null.
+
+  - id: js04-camelcase-index
+    repo: textkit
+    difficulty: medium
+    with_trace: true
+    failing_test: "camelCase"
+    inject:
+      - file: src/text.js
+        find: "return i === 0 ? lower : lower[0].toUpperCase() + lower.slice(1);"
+        replace: "return i === 0 ? lower : lower[1].toUpperCase() + lower.slice(1);"
+    report: >
+      camelCase("hello big world") returns "helloIigOorld" instead of "helloBigWorld".
+    root_cause: camelCase upper-cases lower[1] instead of the first character lower[0] of each subsequent word.

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.codefix/
+runs.db*
+checkpoints.db*
+traces/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.codefix-junit.xml

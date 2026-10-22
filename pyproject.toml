@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codefix-ai"
+version = "0.1.0"
+description = "CodeFix AI: autonomous hierarchical multi-agent bug resolution (LangGraph + MCP + Blackboard)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic==1.13.0",
+    "langgraph==1.2.14",
+    "langgraph-checkpoint-sqlite==3.1.1",
+    "langchain-core==1.6.9",
+    "langsmith==0.14.7",
+    "mcp[cli]==2.3.0",
+    "pydantic==2.14.1",
+    "PyYAML==6.0.3",
+    "python-dotenv==1.2.4",
+    "typer==0.27.3",
+    "rich==15.0.0",
+    "fastapi==0.143.0",
+    "uvicorn[standard]==0.54.0",
+    "chromadb==1.5.9",
+    "sentence-transformers==6.1.0",
+    "PyGithub==2.10.0",
+    "ruff==0.17.0",
+    "ripgrep==15.1.0",
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[project.scripts]
+codefix = "codefix.cli.main:app"
+
+[tool.setuptools.packages.find]
+include = ["codefix*", "mcp_server*", "web*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["benchmarks/bugset/repos", ".codefix", "traces"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "B008", "UP007"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
