@@ -30,9 +30,9 @@
         <div>
           <label for="arch">Architecture</label>
           <select id="arch">
-            <option value="hierarchical">hierarchical (Manager + Blackboard)</option>
-            <option value="sequential">sequential (restart on failure)</option>
-            <option value="p2p">p2p (direct hand-offs)</option>
+            <option value="hierarchical">hierarchical (ADK Manager + Blackboard)</option>
+            <option value="sequential">sequential (ADK LoopAgent, restart on failure)</option>
+            <option value="p2p">p2p (CrewAI peers, direct hand-offs)</option>
           </select>
         </div>
         <div>
@@ -41,7 +41,24 @@
         </div>
         <div>
           <label for="llm">LLM</label>
-          <select id="llm"><option value="live">live (Anthropic API)</option><option value="mock">mock (offline oracle, seeded bugs)</option></select>
+          <select id="llm"><option value="live">live (Gemini API)</option><option value="mock">mock (offline oracle, seeded bugs)</option></select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="variant">Prompt variant</label>
+          <select id="variant">
+            <option value="react">react (ReAct tool loop)</option>
+            <option value="fewshot">fewshot (one shot + examples)</option>
+            <option value="react-reflect">react-reflect (+ Reviewer agent)</option>
+          </select>
+        </div>
+        <div>
+          <label for="persona">Persona</label>
+          <select id="persona">
+            <option value="default">default</option><option value="senior">senior engineer</option>
+            <option value="novice">novice developer</option><option value="security">security reviewer</option>
+          </select>
         </div>
       </div>
       <div style="margin-top:18px; display:flex; gap:12px; align-items:center">
@@ -58,7 +75,8 @@
       </div>
       <div class="card">
         <h2>Pipeline</h2>
-        <img src="/graph.png" alt="Compiled LangGraph: manager routes to diagnoser, fixer, tester, pr_prepare or escalate; workers return to manager; open_pr is interrupted for human confirmation" style="width:100%; background:#fff; border-radius:8px">
+        <img src="/graph.png" alt="Hierarchical architecture: ADK Manager calls the ADK Diagnoser in-process and the CrewAI Fixer, Tester and PR agents over A2A; failed tests go back to the Fixer; a passing patch waits for human approval" style="width:100%; background:#fff; border-radius:8px">
+        <p class="muted" style="margin:10px 0 0">Orchestration: Google ADK · workers: CrewAI · link: A2A (<a href="/a2a/crew/.well-known/agent-card.json">agent card</a>) · tools: MCP</p>
       </div>
     </div>
   </div>
@@ -70,12 +88,14 @@ let cfg;
 (async () => {
   cfg = await api('/api/config');
   if (!cfg.has_api_key) {
-    $('#keyBanner').innerHTML = `<div class="banner warn">⚠ <b>No ANTHROPIC_API_KEY set.</b> Live runs are disabled. Add it to <code>.env</code>, or pick a seeded bug with the <b>mock</b> LLM for an offline demo.</div>`;
+    $('#keyBanner').innerHTML = `<div class="banner warn">⚠ <b>No GEMINI_API_KEY set.</b> Live runs are disabled. Add it to <code>.env</code>, or pick a seeded bug with the <b>mock</b> LLM for an offline demo.</div>`;
     $('#llm').value = 'mock';
   }
   for (const b of cfg.bugs) $('#seed').insertAdjacentHTML('beforeend', `<option value="${esc(b.id)}">${esc(b.id)} · ${esc(b.repo)} · ${esc(b.difficulty)}</option>`);
   $('#models tbody').innerHTML = Object.entries(cfg.models).map(([r, m]) => `<tr><td>${esc(r)}</td><td class="mono">${esc(m.model)}</td><td>${esc(m.effort || '–')}</td></tr>`).join('');
   $('#attempts').value = String(cfg.pipeline.max_attempts);
+  $('#variant').value = cfg.pipeline.prompt_variant;
+  $('#persona').value = cfg.pipeline.persona;
 })();
 
 $('#seed').onchange = () => {
@@ -94,7 +114,8 @@ $('#form').onsubmit = async e => {
     const seed = $('#seed').value || null;
     const { task_id } = await api('/api/runs', { method: 'POST', body: JSON.stringify({
       bug_report: $('#report').value, repo: seed ? '' : $('#repo').value, stack_trace: $('#trace').value,
-      arch: $('#arch').value, max_attempts: +$('#attempts').value, llm: $('#llm').value, bug_id: seed }) });
+      arch: $('#arch').value, max_attempts: +$('#attempts').value, llm: $('#llm').value, bug_id: seed,
+      variant: $('#variant').value, persona: $('#persona').value }) });
     location.href = `/run.html?id=${encodeURIComponent(task_id)}`;
   } catch (err) {
     $('#err').textContent = err.message;

@@ -1,28 +1,15 @@
-"""LangGraph state + per-run context registry."""
+"""Per-run context registry.
+
+Agents on both sides of the A2A boundary look up the live RunContext (Blackboard, MCP toolbox,
+LLM client) by task_id. When the CrewAI service runs in another process, it rebuilds the context
+from the Blackboard run record instead (see codefix/crew_side/a2a_server.py).
+"""
 
 from __future__ import annotations
 
 import threading
-from typing import TypedDict
 
 from codefix.agents.base import RunContext
-
-
-class PipelineState(TypedDict, total=False):
-    task_id: str
-    arch: str
-    next: str               # Manager's routing decision (hierarchical)
-    last_event: str         # what the last worker reported back
-    rediagnoses: int
-    escalation_reason: str
-    pr_confirmed: bool
-    final_status: str
-    # Inline hand-off payloads — used ONLY by sequential / p2p (no blackboard reads there).
-    diagnosis: dict | None
-    patch: dict | None
-    patch_id: str | None
-    test_report: dict | None
-
 
 _CTX: dict[str, RunContext] = {}
 _LOCK = threading.Lock()
@@ -33,8 +20,9 @@ def register(ctx: RunContext) -> None:
         _CTX[ctx.task_id] = ctx
 
 
-def ctx_for(state: PipelineState) -> RunContext:
-    return _CTX[state["task_id"]]
+def get_ctx(task_id: str) -> RunContext | None:
+    with _LOCK:
+        return _CTX.get(task_id)
 
 
 def unregister(task_id: str) -> None:

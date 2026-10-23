@@ -1,30 +1,9 @@
----
-config:
-  flowchart:
-    curve: linear
----
-graph TD;
-	__start__([<p>__start__</p>]):::first
-	manager(manager)
-	diagnoser(diagnoser)
-	fixer(fixer)
-	tester(tester)
-	pr_prepare(pr_prepare)
-	open_pr(open_pr<hr/><small><em>__interrupt = before</em></small>)
-	escalate(escalate)
-	__end__([<p>__end__</p>]):::last
-	__start__ --> manager;
-	diagnoser --> manager;
-	fixer --> manager;
-	manager -.-> diagnoser;
-	manager -.-> escalate;
-	manager -.-> fixer;
-	manager -.-> pr_prepare;
-	manager -.-> tester;
-	pr_prepare --> open_pr;
-	tester --> manager;
-	escalate --> __end__;
-	open_pr --> __end__;
-	classDef default fill:#f2f0ff,line-height:1.2
-	classDef first fill-opacity:0
-	classDef last fill:#bfb6fc
+flowchart LR
+    U([bug report]) --> G{{input guardrail}} --> M[Manager<br/>ADK custom agent]
+    M <-->|in-process| D[Diagnoser<br/>ADK LlmAgent + MCP tools]
+    M <-->|A2A fix| F[Fixer crew<br/>CrewAI]
+    M <-->|A2A test| T[Tester<br/>CrewAI Flow]
+    M -->|A2A pr_prepare| P[PR agent<br/>CrewAI Flow] --> H([human approval])
+    M -->|attempt cap / early stop| E([escalation note])
+    T -.->|tests failed| M
+    M -.->|retry Fixer, TestReport by ref| F

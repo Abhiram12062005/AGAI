@@ -33,8 +33,14 @@ def test_stdio_calls_and_telemetry(toolbox):
     assert seen[-1]["ok"] is False
 
 
-def test_langchain_binding(toolbox):
-    tools = {t.name: t for t in toolbox.langchain_tools(["read_file", "list_tree"])}
+def test_adk_tool_binding(toolbox):
+    import asyncio
+
+    from codefix.adk_side.tools import mcp_tools
+
+    tools = {t.name: t for t in mcp_tools(toolbox, ["read_file", "list_tree"], task_id="t1", agent="diagnoser")}
     assert set(tools) == {"read_file", "list_tree"}
-    out = tools["list_tree"].invoke({"path": "."})
+    decl = tools["read_file"]._get_declaration()
+    assert decl.name == "read_file" and "path" in decl.parameters_json_schema["properties"]
+    out = asyncio.run(tools["list_tree"].run_async(args={"path": "."}, tool_context=None))
     assert "pkg/mathx.py" in out["files"]

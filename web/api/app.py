@@ -10,6 +10,9 @@ API:
   GET  /api/runs/{id}/source           read-only source excerpt for a citation
   POST /api/runs/{id}/pr               {confirm: true|false} — the ONLY way a PR is opened from the UI
   GET  /api/dashboard                  aggregates for the dashboard
+A2A:
+  /a2a/crew/                           the CrewAI worker agents (JSON-RPC A2A endpoint)
+  /a2a/crew/.well-known/agent-card.json  their agent card
 """
 
 from __future__ import annotations
@@ -26,14 +29,29 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from codefix import config
+from codefix import config, prompts
 from codefix.blackboard import new_task_id
 from codefix.graph import runner
 
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
-app = FastAPI(title="CodeFix AI", version="0.1.0")
-config.settings()  # loads .env (ANTHROPIC_API_KEY, GITHUB_TOKEN) before any request
+app = FastAPI(title="CodeFix AI", version="0.2.0")
+config.settings()  # loads .env (GEMINI_API_KEY, GITHUB_TOKEN) before any request
 _threads: dict[str, threading.Thread] = {}
+
+
+def _mount_a2a() -> None:
+    from codefix.crew_side.a2a_server import build_app, public_url
+
+    app.mount("/a2a/crew", build_app(public_url()))
+
+
+_mount_a2a()
+
+
+def _has_key() -> bool:
+    if config.settings().provider == "google":
+        return bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
 class RunRequest(BaseModel):
@@ -44,6 +62,8 @@ class RunRequest(BaseModel):
     stack_trace: str = ""
     llm: str = "live"
     bug_id: str | None = None  # seeded bug: materialise a fresh demo repo
+    variant: str | None = None  # react | fewshot | react-reflect
+    persona: str | None = None  # default | senior | novice | security
 
 
 class PRRequest(BaseModel):
@@ -59,7 +79,10 @@ def get_config():
         "archs": list(runner.ARCHS),
         "models": {r: c.model_dump() for r, c in s.roles.items()},
         "pipeline": s.pipeline.model_dump(),
-        "has_api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "provider": s.provider,
+        "variants": list(prompts.VARIANTS),
+        "personas": list(prompts.PERSONAS),
+        "has_api_key": _has_key(),
         "bugs": [{"id": b.id, "repo": b.repo, "difficulty": b.difficulty, "report": b.report} for b in load_bugs()],
     }
 
@@ -91,11 +114,17 @@ def start_run(req: RunRequest):
         raise HTTPException(400, "bug_report and repo are required")
     if not Path(repo).is_dir():
         raise HTTPException(400, f"repo path not found: {repo}")
-    if req.llm == "live" and not os.environ.get("ANTHROPIC_API_KEY"):
-        raise HTTPException(400, "ANTHROPIC_API_KEY is not set — add it to .env or use the mock LLM with a seeded bug")
+    if req.llm == "live" and not _has_key():
+        raise HTTPException(400, "no model API key is set (GEMINI_API_KEY in .env) — or use the mock LLM with a seeded bug")
+    extra = {k: v for k, v in (("variant", req.variant), ("persona", req.persona)) if v}
+    try:
+        prompts.check(extra.get("variant", "react"), extra.get("persona", "default"))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
     # register synchronously so the run page can load the moment we return the id
-    runner.create_run_record(task_id, report, repo, req.arch, req.max_attempts, req.llm, stack, bug_id=req.bug_id)
+    runner.create_run_record(task_id, report, repo, req.arch, req.max_attempts, req.llm, stack, bug_id=req.bug_id,
+                             extra=extra)
 
     def work():
         runner.run_pipeline(report, repo, arch=req.arch, max_attempts=req.max_attempts, llm_mode=req.llm,
@@ -153,6 +182,13 @@ def get_run(task_id: str):
     snap["react"] = [e for e in events if e["type"] == "react_step"]
     snap["test_outputs"] = [e for e in events if e["type"] == "test_output"]
     snap["manager_decisions"] = [e for e in events if e["type"] == "manager_decision"]
+    snap["a2a"] = [e for e in events if e["type"] in ("a2a_request", "a2a_response")]
+    snap["guardrails"] = [e for e in events if e["type"] == "guardrail"]
+    hooks: dict[str, int] = defaultdict(int)
+    for e in events:
+        if e["type"] == "callback":
+            hooks[f"{e.get('framework')}:{e.get('hook')}"] += 1
+    snap["callbacks"] = dict(sorted(hooks.items()))
     snap["patches"] = [a["body"] | {"id": a["id"]} for a in bb.artifacts(task_id, "patch")]
     snap["test_reports"] = [a["body"] | {"id": a["id"]} for a in bb.artifacts(task_id, "test_report")]
     snap["spans"] = _spans(snap["messages"])

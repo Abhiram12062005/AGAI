@@ -46,16 +46,15 @@ def sample_repo(tmp_path):
 
 @pytest.fixture()
 def isolated(tmp_path, monkeypatch):
-    """Point every persistent path (db, traces, checkpoints, index, sandbox) at tmp_path."""
+    """Point every persistent path (db, traces, index, sandbox) at tmp_path."""
     from codefix import config, mcp_client
     from codefix.graph import runner
 
     monkeypatch.setenv("CODEFIX_MCP_TRANSPORT", "inprocess")
     for name, val in (("DB_PATH", tmp_path / "runs.db"), ("TRACES_DIR", tmp_path / "traces"),
-                      ("CHECKPOINT_DB", tmp_path / "ckpt.db"), ("INDEX_DIR", tmp_path / "index"),
+                      ("INDEX_DIR", tmp_path / "index"),
                       ("SANDBOX_DIR", tmp_path / "sandbox")):
         monkeypatch.setattr(config, name, val)
     monkeypatch.setattr(runner, "_BB", None)
-    monkeypatch.setattr(runner, "_CKPT", None)
     monkeypatch.setattr(mcp_client, "_CACHE", {})
     return tmp_path

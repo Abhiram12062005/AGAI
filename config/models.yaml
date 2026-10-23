@@ -46,6 +46,13 @@ pricing:
   claude-sonnet-5:   {input: 2.00, output: 10.00, cache_read: 0.20, cache_write: 2.50}
   mock:              {input: 0.0,  output: 0.0,   cache_read: 0.0,  cache_write: 0.0}
 
+# Paid-tier list prices (USD per 1M text tokens) used ONLY for the benchmark report's
+# "what would this cost if billed" estimate. Source: ai.google.dev/gemini-api/docs/pricing,
+# read 2026-10-22 (gemini-3.8-flash promotional price, valid through 2026-12-31).
+estimate_pricing:
+  gemini-3.8-flash (all agents):      {input: 0.75, output: 3.75}
+  gemini-3.1-flash-lite (all agents): {input: 0.25, output: 1.50}
+
 pipeline:
   max_attempts: 3            # Fixer attempts before escalating to a human
   react_max_iterations: 8    # Diagnoser ReAct cap; degrades to best-effort diagnosis
@@ -54,3 +61,5 @@ pipeline:
   test_timeout_s: 180
   allow_test_edits: false    # patches that modify test files are rejected
   rag_k: 6
+  prompt_variant: react      # react | fewshot | react-reflect   (override per run: --variant)
+  persona: default           # default | senior | novice | security (override per run: --persona)

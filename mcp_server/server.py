@@ -1,4 +1,4 @@
-"""CodeFix MCP server (MCPServer, the mcp 2.x name for FastMCP; stdio transport).
+"""CodeFix MCP server (FastMCP from the official MCP Python SDK; stdio transport).
 
 Every agent reaches the repository, the test runner, git and RAG through this server, so
 tool access is uniform regardless of which model backs an agent.
@@ -19,11 +19,11 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from mcp_server.tools import ToolContext  # noqa: E402
 
-mcp = MCPServer("codefix", instructions="Repository, test, git and RAG tools for CodeFix AI agents.",
+mcp = FastMCP("codefix", instructions="Repository, test, git and RAG tools for CodeFix AI agents.",
                 log_level="WARNING")
 _ctx: ToolContext | None = None
 
@@ -174,6 +174,12 @@ def main() -> None:
     import logging
 
     logging.getLogger().setLevel(logging.WARNING)
+    # FastMCP runs sync tools in worker threads; on Windows the first import of a native extension
+    # (numpy, scipy via sentence-transformers, chromadb) from a worker thread deadlocks while the
+    # main thread blocks on stdin. Load the whole RAG stack here, on the main thread, first.
+    rag = ctx().rag
+    if rag is not None:
+        rag.embedder.embed(["warm-up"])
     mcp.run(transport="stdio")
 
 

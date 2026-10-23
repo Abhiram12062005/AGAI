@@ -1,6 +1,8 @@
-"""Thin MCP client: binds the CodeFix MCP server's tools as LangChain tools.
+"""Thin MCP client: exposes the CodeFix MCP server's tools to the agent frameworks.
 
-The MCP Python SDK is async; LangGraph nodes here are sync. A dedicated background event
+`Toolbox.specs` (name, description, JSON schema) is what the ADK side turns into native ADK
+tools (codefix/adk_side/tools.py); every call goes through `Toolbox.call`. The MCP Python SDK
+is async while the CrewAI steps run in worker threads. A dedicated background event
 loop thread owns the stdio session for the lifetime of the toolbox, and sync callers submit
 coroutines to it. Every tool call is logged (args, latency, ok/error) to the Blackboard and
 the JSONL trace under the calling agent's name.
@@ -21,36 +23,15 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
-from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field, create_model
-
 from codefix import config
-
-_JSON_TO_PY = {"string": str, "integer": int, "number": float, "boolean": bool, "array": list, "object": dict}
 
 
 class ToolError(RuntimeError):
     pass
 
 
-def _args_model(name: str, schema: dict) -> type[BaseModel]:
-    props = schema.get("properties", {})
-    required = set(schema.get("required", []))
-    fields: dict[str, Any] = {}
-    for pname, p in props.items():
-        t = p.get("type")
-        if t is None and "anyOf" in p:
-            t = next((x.get("type") for x in p["anyOf"] if x.get("type") != "null"), "string")
-        py = _JSON_TO_PY.get(t, str)
-        if pname in required:
-            fields[pname] = (py, Field(..., description=p.get("description", "")))
-        else:
-            fields[pname] = (py | None, Field(p.get("default"), description=p.get("description", "")))
-    return create_model(f"{name}_args", **fields)
-
-
 class Toolbox:
-    """Holds an MCP session and exposes tools as LangChain StructuredTools."""
+    """Holds an MCP session; `specs` describes the tools, `call` invokes one with telemetry."""
 
     def __init__(self, repo_root: Path, transport: str = "stdio"):
         self.repo = Path(repo_root).resolve()
@@ -150,21 +131,9 @@ class Toolbox:
                                "latency_ms": int((time.time() - started) * 1000),
                                "result": result if ok else error})
 
-    def langchain_tools(self, names: list[str] | None = None, *, task_id: str | None = None,
-                        agent: str = "system") -> list[StructuredTool]:
-        """Bind MCP tools as LangChain tools (sync)."""
-        tools = []
-        for name, spec in self.specs.items():
-            if names and name not in names:
-                continue
-
-            def _fn(_name=name, **kwargs):
-                return self.call(_name, kwargs, task_id=task_id, agent=agent)
-
-            tools.append(StructuredTool.from_function(
-                func=_fn, name=name, description=spec["description"],
-                args_schema=_args_model(name, spec["schema"])))
-        return tools
+    def tool_specs(self, names: list[str] | None = None) -> dict[str, dict]:
+        """{name: {description, schema}} for the requested tools (all when `names` is None)."""
+        return {n: spec for n, spec in self.specs.items() if not names or n in names}
 
     def close(self) -> None:
         if self._loop and self._stack:

@@ -13,10 +13,12 @@ import json
 
 from codefix.agents.base import (
     EscalationSummary,
+    FinalDiagnosis,
     FixerOutput,
     JudgeVerdict,
     ManagerDecision,
     ReActStep,
+    ReviewOutput,
 )
 from codefix.eval.bugset import Bug
 
@@ -37,6 +39,12 @@ class OracleMock:
                     "final_answer": {"root_cause": b.root_cause, "implicated_files": b.files,
                                      "implicated_symbols": [], "evidence": [f"{b.files[0]}: {b.inject[0]['replace']}"],
                                      "confidence": 0.85, "citations": []}}
+        if schema is FinalDiagnosis:  # few-shot variant: one step, no tool loop
+            return {"root_cause": b.root_cause, "implicated_files": b.files, "implicated_symbols": [],
+                    "evidence": [f"{b.files[0]}: {b.inject[0]['replace']}"], "confidence": 0.8,
+                    "citations": [f"file:{b.files[0]}"]}
+        if schema is ReviewOutput:  # reflection: the Reviewer approves (the retry loop is exercised by fail_first)
+            return {"approved": True, "issues": [], "revised": None}
         if schema is FixerOutput:
             self.fixer_calls += 1
             first = b.inject[0]

@@ -1,17 +1,22 @@
-"""Fixer — turns a Diagnosis into a Patch (unified diff + rationale).
+"""Fixer — turns a Diagnosis into a Patch (unified diff + rationale). A CrewAI crew.
 
-The model sees the implicated files (numbered), retrieved code chunks and past accepted fixes,
-and — on a retry — the previous attempt's diff plus the TestReport that rejected it. It emits
-anchored find/replace edits; the unified diff is derived deterministically (see patching.py).
-One internal repair turn is allowed when an edit anchor does not match.
+Context gathering is deterministic: the implicated files (numbered), retrieved code chunks and
+past accepted fixes, and — on a retry — the previous attempt's diff plus the TestReport that
+rejected it. The model call is a CrewAI Agent + Task with `output_pydantic=FixerOutput`. The
+Task's guardrail applies the anchored find/replace edits (the unified diff is derived
+deterministically, see patching.py), rejects test edits and unsafe code (codefix/guardrails.py)
+and, on failure, sends the reason back to the Fixer for one repair turn.
+
+Prompt variant `react-reflect` adds a second agent, the Reviewer, whose Task critiques the patch
+(Reflection pattern) and may return a revised one.
 """
 
 from __future__ import annotations
 
-from codefix.agents.base import FixerOutput, RunContext, chunk_ids, clip, format_chunks
+from codefix import guardrails, prompts
+from codefix.agents.base import FixerOutput, ReviewOutput, RunContext, chunk_ids, clip, format_chunks
 from codefix.agents.patching import EditError, build_diff, is_test_path
 from codefix.blackboard import Diagnosis, Patch, TestReport
-from codefix.llm import LLMError
 from mcp_server.sandbox import norm_rel
 
 SYSTEM = """You are the Fixer in CodeFix AI, a multi-agent bug-resolution system.
@@ -37,8 +42,7 @@ def _read_raw(ctx: RunContext, path: str) -> str | None:
         return None
 
 
-def run(ctx: RunContext, diagnosis: Diagnosis, attempt_no: int, feedback: TestReport | None = None,
-        previous: Patch | None = None) -> Patch:
+def _gather(ctx: RunContext, diagnosis: Diagnosis) -> tuple[dict[str, str], list[dict], list[dict], set[str]]:
     allow_tests = ctx.settings.pipeline.allow_test_edits
     files = [f for f in diagnosis.implicated_files if allow_tests or not is_test_path(f)][:4]
     originals: dict[str, str] = {}
@@ -55,7 +59,6 @@ def run(ctx: RunContext, diagnosis: Diagnosis, attempt_no: int, feedback: TestRe
                 raw = _read_raw(ctx, h["file"])
                 if raw is not None:
                     originals[h["file"]] = raw
-
     known = {f"file:{p}" for p in originals}
     chunks, past = [], []
     try:
@@ -66,7 +69,11 @@ def run(ctx: RunContext, diagnosis: Diagnosis, attempt_no: int, feedback: TestRe
         ctx.event("rag_error", agent="fixer", error=str(e))
     known |= chunk_ids(chunks) | chunk_ids(past)
     ctx.event("rag_retrieval", agent="fixer", ids=sorted(chunk_ids(chunks) | chunk_ids(past)))
+    return originals, chunks, past, known
 
+
+def _prompt(ctx: RunContext, diagnosis: Diagnosis, originals: dict[str, str], chunks, past, attempt_no: int,
+            feedback: TestReport | None, previous: Patch | None) -> str:
     numbered = "\n\n".join(
         f"[file:{p}]\n" + "\n".join(f"{i:>5}| {ln}" for i, ln in enumerate(src.splitlines(), 1))[:12000]
         for p, src in originals.items())
@@ -83,35 +90,109 @@ def run(ctx: RunContext, diagnosis: Diagnosis, attempt_no: int, feedback: TestRe
                    f"LINT FINDINGS:\n{clip([f.model_dump() for f in feedback.lint_findings], 1000)}\n"
                    f"TEST OUTPUT / STACK TRACE:\n{clip(feedback.stack_trace, 4000)}\n"
                    "Note: the previous diff was NOT applied — edit the CURRENT files shown above.\n")
-    messages = [{"role": "user", "content": prompt}]
+    return prompt
 
-    last_error = ""
-    for turn in range(2):
-        try:
-            res = ctx.llm.structured(role="fixer", system=SYSTEM, messages=messages, schema=FixerOutput,
-                                     task_id=ctx.task_id, agent="fixer")
-        except LLMError as e:
-            return Patch(diff="", rationale="", attempt_no=attempt_no, generation_error=str(e))
-        out: FixerOutput = res.parsed
+
+class _PatchBuilder:
+    """Turns FixerOutput edits into a verified unified diff (the Task guardrail's work)."""
+
+    def __init__(self, ctx: RunContext, originals: dict[str, str], known: set[str]):
+        self.ctx, self.originals, self.known = ctx, originals, known
+        self.built = None
+        self.output: FixerOutput | None = None
+        self.last_error = ""
+
+    def build(self, out: FixerOutput):
+        allow_tests = self.ctx.settings.pipeline.allow_test_edits
         edits = [e.model_dump() for e in out.edits]
+        for e in edits:
+            e["path"] = norm_rel(e["path"])
+            if not allow_tests and is_test_path(e["path"]):
+                raise EditError(f"editing test file '{e['path']}' is not allowed; fix the source code")
+            if e["path"] not in self.originals:
+                raw = _read_raw(self.ctx, e["path"])
+                if raw is None:
+                    raise EditError(f"file '{e['path']}' does not exist or is not readable")
+                self.originals[e["path"]] = raw
+        built = build_diff(self.originals, edits)
+        safety = guardrails.patch_safety(built.diff)
+        self.ctx.event("guardrail", stage="patch_safety", **safety.model_dump())
+        if not safety.allowed:
+            raise EditError("patch rejected by the safety guardrail: " + "; ".join(safety.reasons))
+        return built
+
+    def guardrail(self, task_output):  # no annotation: CrewAI checks it literally and ours is a string
+        """CrewAI task guardrail: (True, output) to accept, (False, feedback) to send it back."""
         try:
-            for e in edits:
-                e["path"] = norm_rel(e["path"])
-                if not allow_tests and is_test_path(e["path"]):
-                    raise EditError(f"editing test file '{e['path']}' is not allowed; fix the source code")
-                if e["path"] not in originals:
-                    raw = _read_raw(ctx, e["path"])
-                    if raw is None:
-                        raise EditError(f"file '{e['path']}' does not exist or is not readable")
-                    originals[e["path"]] = raw
-            built = build_diff(originals, edits)
-            cites = [c for c in out.citations if c in known]
-            return Patch(diff=built.diff, rationale=out.rationale, files_touched=built.files,
-                         attempt_no=attempt_no, citations=cites)
-        except EditError as e:
-            last_error = str(e)
-            ctx.event("fixer_edit_error", agent="fixer", turn=turn, error=last_error)
-            messages += [{"role": "assistant", "content": res.assistant_content},
-                         {"role": "user", "content": f"Your edits could not be applied: {last_error}. "
-                          "Copy `find` text exactly from the CURRENT files and try again."}]
-    return Patch(diff="", rationale="", attempt_no=attempt_no, generation_error=last_error)
+            out = task_output.pydantic or FixerOutput.model_validate_json(task_output.raw)
+            self.built, self.output = self.build(out), out
+            return True, task_output.raw
+        except Exception as e:  # EditError, validation error: feed the reason back to the Fixer
+            self.last_error = str(e)
+            self.ctx.event("fixer_edit_error", agent="fixer", error=self.last_error)
+            return False, (f"Your edits could not be applied: {self.last_error}. "
+                           "Copy `find` text exactly from the CURRENT files and try again.")
+
+
+def run(ctx: RunContext, diagnosis: Diagnosis, attempt_no: int, feedback: TestReport | None = None,
+        previous: Patch | None = None) -> Patch:
+    from crewai import Agent, Crew, Process, Task
+
+    from codefix.crew_side.llm import CodefixCrewLLM
+    from codefix.observability.callbacks import crew_callbacks, install_crew_listener
+
+    install_crew_listener()
+    persona = ctx.extra.get("persona", "default")
+    reflect = ctx.extra.get("variant") == "react-reflect"
+    originals, chunks, past, known = _gather(ctx, diagnosis)
+    prompt = _prompt(ctx, diagnosis, originals, chunks, past, attempt_no, feedback, previous)
+    builder = _PatchBuilder(ctx, originals, known)
+
+    fixer_llm = CodefixCrewLLM(model=ctx.settings.role("fixer").model, task_id=ctx.task_id, role="fixer",
+                               agent="fixer", default_schema=FixerOutput)
+    fixer = Agent(role="Fixer", goal="Write the smallest correct patch for the diagnosed root cause",
+                  backstory=prompts.with_persona(SYSTEM, persona), llm=fixer_llm,
+                  allow_delegation=False, verbose=False, max_iter=2)
+    fix_task = Task(name="write_patch", description=prompt,  # kickoff() has no inputs: braces in code stay literal
+                    expected_output="JSON: rationale, edits[{path, find, replace}], citations, confidence",
+                    agent=fixer, output_pydantic=FixerOutput, guardrail=builder.guardrail,
+                    guardrail_max_retries=1)
+    agents, tasks = [fixer], [fix_task]
+    review_task = None
+    if reflect:
+        reviewer = Agent(role="Reviewer", goal="Critique the proposed patch before it is tested",
+                         backstory=prompts.with_persona(prompts.REVIEWER_SYSTEM, persona),
+                         llm=CodefixCrewLLM(model=ctx.settings.role("reviewer").model, task_id=ctx.task_id,
+                                            role="reviewer", agent="reviewer", default_schema=ReviewOutput),
+                         allow_delegation=False, verbose=False, max_iter=2)
+        review_task = Task(name="review_patch",
+                           description=f"{prompt}\n\nReview the Fixer's proposed patch (in your context).",
+                           expected_output="JSON: approved, issues, revised", agent=reviewer,
+                           output_pydantic=ReviewOutput, context=[fix_task])
+        agents.append(reviewer)
+        tasks.append(review_task)
+
+    crew = Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False, **crew_callbacks(ctx.task_id))
+    try:
+        result = crew.kickoff()
+    except Exception as e:
+        if builder.built is None:  # guardrail retries exhausted or model error
+            return Patch(diff="", rationale="", attempt_no=attempt_no,
+                         generation_error=builder.last_error or str(e))
+        result = None
+    if builder.built is None:
+        return Patch(diff="", rationale="", attempt_no=attempt_no, generation_error=builder.last_error or "no patch")
+
+    out, built = builder.output, builder.built
+    if review_task is not None and result is not None:
+        review = review_task.output.pydantic if review_task.output else None
+        ctx.event("reflection", agent="reviewer", approved=getattr(review, "approved", None),
+                  issues=getattr(review, "issues", []))
+        if review is not None and not review.approved and review.revised is not None:
+            try:  # a revision must pass the same guardrails as the original
+                built, out = builder.build(review.revised), review.revised
+            except Exception as e:
+                ctx.event("reflection_rejected", agent="reviewer", error=str(e))
+    cites = [c for c in out.citations if c in known]
+    return Patch(diff=built.diff, rationale=out.rationale, files_touched=built.files, attempt_no=attempt_no,
+                 citations=cites)

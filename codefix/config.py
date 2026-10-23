@@ -15,7 +15,6 @@ CONFIG_PATH = Path(os.environ.get("CODEFIX_CONFIG", ROOT / "config" / "models.ya
 DATA_DIR = Path(os.environ.get("CODEFIX_DATA_DIR", ROOT))
 TRACES_DIR = DATA_DIR / "traces"
 DB_PATH = DATA_DIR / "runs.db"
-CHECKPOINT_DB = DATA_DIR / "checkpoints.db"
 INDEX_DIR = DATA_DIR / ".codefix" / "index"
 SANDBOX_DIR = DATA_DIR / ".codefix" / "sandbox"
 
@@ -43,15 +42,21 @@ class PipelineConfig(BaseModel):
     test_timeout_s: int = 180
     allow_test_edits: bool = False
     rag_k: int = 6
+    prompt_variant: str = "react"   # react | fewshot | react-reflect (codefix/prompts.py)
+    persona: str = "default"        # default | senior | novice | security
 
 
 class Settings(BaseModel):
     provider: Literal["anthropic", "google"] = "anthropic"
     roles: dict[str, RoleConfig]
     pricing: dict[str, Price] = Field(default_factory=dict)
+    # paid-tier list prices used only for the benchmark's "what would this cost" estimate
+    estimate_pricing: dict[str, Price] = Field(default_factory=dict)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
 
     def role(self, name: str) -> RoleConfig:
+        if name == "reviewer" and name not in self.roles:  # Reflection reviewer defaults to the Fixer's model
+            return self.roles["fixer"]
         return self.roles[name]
 
 

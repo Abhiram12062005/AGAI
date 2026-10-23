@@ -124,15 +124,7 @@ class AnthropicLLM(BaseLLM):
         import anthropic
 
         self._anthropic = anthropic
-        client = anthropic.Anthropic(max_retries=4, timeout=600)
-        if os.environ.get("LANGCHAIN_TRACING_V2", "").lower() == "true":
-            try:  # optional LangSmith export of every model call
-                from langsmith.wrappers import wrap_anthropic
-
-                client = wrap_anthropic(client)
-            except Exception:
-                pass
-        self.client = client
+        self.client = anthropic.Anthropic(max_retries=4, timeout=600)
 
     def _request(self, rc: RoleConfig, system: str, messages: list[dict], schema: dict) -> Any:
         output_config: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}

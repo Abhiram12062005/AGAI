@@ -1,5 +1,8 @@
 """Agent steps shared by all three architectures.
 
+`diagnose` runs on the ADK side (async); `fix`, `test`, `pr_prepare` run on the CrewAI side
+(called from the CrewAI Flows behind the A2A server).
+
 Each step runs one agent and records the exchange as typed envelopes on the Blackboard
 (in_progress on start, success/failure on completion). Architectures differ only in *who
 the envelopes are addressed to* and *where inputs come from* (Blackboard refs vs. inline).
@@ -19,10 +22,10 @@ def _started(ctx: RunContext, agent: str, target: str, note: str) -> None:
     ctx.post(agent, target, "in_progress", DispatchRef(instruction=note), 1.0)
 
 
-def diagnose(ctx: RunContext, reply_to: str) -> tuple[Diagnosis, str | None, bool]:
+async def diagnose(ctx: RunContext, reply_to: str) -> tuple[Diagnosis, str | None, bool]:
     _started(ctx, "diagnoser", reply_to, "diagnosing")
     try:
-        diag, _ = diagnoser.run(ctx)
+        diag, _ = await diagnoser.run(ctx)
         ok = diag.confidence > 0 and bool(diag.root_cause.strip())
     except Exception as e:
         ctx.event("agent_error", agent="diagnoser", error=repr(e), tb=traceback.format_exc()[-3000:])
@@ -109,10 +112,11 @@ def history(ctx: RunContext) -> list[dict]:
     return out
 
 
-def escalate(ctx: RunContext, reason: str, use_llm: bool) -> Escalation:
+def escalate(ctx: RunContext, reason: str, use_llm: bool, summary=None) -> Escalation:
+    """`summary`: the Manager's (ADK) escalation note; sequential/p2p have no Manager and get the
+    templated hand-off note."""
     hist = history(ctx)
-    # no Manager in sequential/p2p: those get the templated hand-off note
-    s = manager.escalation_summary(ctx, reason, hist, use_llm=use_llm)
+    s = summary or manager.fallback_summary(ctx, reason, hist)
     run = ctx.bb.get_run(ctx.task_id)
     esc = Escalation(reason=reason, summary=s.summary, attempts=run["attempts"], tried=s.tried)
     ctx.post("manager" if use_llm else "system", "human", "failure", esc, 1.0)

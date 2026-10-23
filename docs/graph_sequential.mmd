@@ -1,27 +1,8 @@
----
-config:
-  flowchart:
-    curve: linear
----
-graph TD;
-	__start__([<p>__start__</p>]):::first
-	diagnoser(diagnoser)
-	fixer(fixer)
-	tester(tester)
-	pr_prepare(pr_prepare)
-	open_pr(open_pr<hr/><small><em>__interrupt = before</em></small>)
-	escalate(escalate)
-	__end__([<p>__end__</p>]):::last
-	__start__ --> diagnoser;
-	diagnoser -.-> escalate;
-	diagnoser -.-> fixer;
-	fixer --> tester;
-	pr_prepare --> open_pr;
-	tester -.-> diagnoser;
-	tester -.-> escalate;
-	tester -.-> pr_prepare;
-	escalate --> __end__;
-	open_pr --> __end__;
-	classDef default fill:#f2f0ff,line-height:1.2
-	classDef first fill-opacity:0
-	classDef last fill:#bfb6fc
+flowchart LR
+    U([bug report]) --> L
+    subgraph L[ADK LoopAgent: max_attempts]
+      D[Diagnose<br/>ADK] --> F[Fix<br/>CrewAI via A2A] --> T[Test<br/>CrewAI via A2A] --> G{gate}
+    end
+    G -->|failed: restart from diagnosis| D
+    G -->|passed| P[PR prepare] --> H([human approval])
+    L -->|loop exhausted| E([escalation])

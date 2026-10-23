@@ -48,6 +48,8 @@
     <div class="grid g2">
       <div class="card"><h2>LLM calls</h2><div id="llm" style="max-height:320px; overflow:auto"></div></div>
       <div class="card"><h2>Message log (Blackboard)</h2><div id="log" style="max-height:320px; overflow:auto"></div></div>
+      <div class="card"><h2>A2A exchanges (ADK ↔ CrewAI)</h2><div id="a2a" style="max-height:320px; overflow:auto"><div class="empty">–</div></div></div>
+      <div class="card"><h2>Guardrails &amp; framework callbacks</h2><div id="guards" style="max-height:320px; overflow:auto"><div class="empty">–</div></div></div>
     </div>
   </div>
 </main>
@@ -162,6 +164,15 @@ function renderDecisions(s) {
   $('#decisions').innerHTML = '<table><tbody>' + s.manager_decisions.map(d =>
     `<tr><td class="muted">${esc(d.event)}</td><td><b>→ ${esc(d.decision)}</b></td><td class="muted">${esc(d.reason)}</td></tr>`).join('') + '</tbody></table>';
 }
+function renderA2A(s) {
+  const rows = (s.a2a || []).filter(e => e.type === 'a2a_response');
+  if (rows.length) $('#a2a').innerHTML = '<table><thead><tr><th>Skill</th><th>Message id</th><th>OK</th><th class="num">Latency</th></tr></thead><tbody>' +
+    rows.map(e => `<tr><td><b>${esc(e.skill)}</b></td><td class="mono">${esc(e.message_id)}</td><td>${e.ok ? '✅' : '❌ ' + esc(e.error || '')}</td><td class="num">${fmtMs(e.latency_ms)}</td></tr>`).join('') + '</tbody></table>';
+  const g = (s.guardrails || []).map(e => `<tr><td>${esc(e.stage)}</td><td>${e.allowed && e.category === 'ok' ? '✅ ok' : '⚠ ' + esc(e.category)}</td><td class="muted">${esc((e.reasons || []).join('; ')).slice(0, 160)}</td></tr>`);
+  const c = Object.entries(s.callbacks || {}).map(([k, n]) => `<span class="chip">${esc(k)} × ${n}</span>`).join(' ');
+  if (g.length || c) $('#guards').innerHTML = (g.length ? '<table><tbody>' + g.join('') + '</tbody></table>' : '') +
+    (c ? `<div style="margin-top:8px">${c}</div>` : '');
+}
 function renderPatch(s) {
   if (!s.patches.length) return;
   if (!pinnedAttempt || selectedAttempt >= s.patches.length) selectedAttempt = s.patches.length - 1;  // follow the latest unless the user picked one
@@ -269,7 +280,7 @@ document.addEventListener('click', async e => {
 async function refresh() {
   snap = await api(`/api/runs/${encodeURIComponent(TASK)}`);
   renderHeader(snap); drawPipeline(snap); renderReact(snap); renderDiagnosis(snap); renderDecisions(snap);
-  renderPatch(snap); renderTests(snap); renderOutcome(snap); renderTables(snap);
+  renderPatch(snap); renderTests(snap); renderOutcome(snap); renderTables(snap); renderA2A(snap);
 }
 function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 250); }
 

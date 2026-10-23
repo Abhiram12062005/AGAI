@@ -1,4 +1,9 @@
-"""Markdown comparison report: hierarchical vs sequential vs p2p."""
+"""Markdown comparison report: architectures (hierarchical | sequential | p2p) x prompt variants
+(react | fewshot | react-reflect) x personas.
+
+Each column is one configuration, labelled `arch·variant·persona` (only the dimensions that
+vary in the benchmark appear in the label).
+"""
 
 from __future__ import annotations
 
@@ -16,10 +21,16 @@ def _pct(n: int, d: int) -> str:
     return f"{100 * n / d:.0f}%" if d else "n/a"
 
 
-def summarize(rows: list[dict]) -> dict[str, dict]:
+def labeler(rows: list[dict]):
+    varied = [k for k in ("arch", "variant", "persona") if len({r.get(k) or "" for r in rows}) > 1] or ["arch"]
+    return lambda r: "·".join(str(r.get(k) or ("react" if k == "variant" else "default")) for k in varied)
+
+
+def summarize(rows: list[dict], key=None) -> dict[str, dict]:
+    key = key or labeler(rows)
     by = defaultdict(list)
     for r in rows:
-        by[r["arch"]].append(r)
+        by[key(r)].append(r)
     out = {}
     for arch, rs in sorted(by.items()):
         n = len(rs)
@@ -57,7 +68,8 @@ def write_report(bench_id: str, path: Path, rows: list[dict] | None = None) -> P
     from codefix.eval.bench import bench_rows
 
     rows = rows if rows is not None else bench_rows(bench_id)
-    s = summarize(rows)
+    label = labeler(rows)
+    s = summarize(rows, label)
     mode = {r["llm_mode"] for r in rows}
     lines = [f"# CodeFix AI benchmark — `{bench_id}`\n"]
     if "mock" in mode:
@@ -120,7 +132,7 @@ def write_report(bench_id: str, path: Path, rows: list[dict] | None = None) -> P
     cell = defaultdict(list)
     diff = {}
     for r in rows:
-        cell[(r["bug_id"], r["arch"])].append(f"{'✅' if r['objective_pass'] else '❌'}{r['attempts']}")
+        cell[(r["bug_id"], label(r))].append(f"{'✅' if r['objective_pass'] else '❌'}{r['attempts']}")
         diff[r["bug_id"]] = r["difficulty"]
     for b in bugs:
         lines.append(f"| {b} | {diff.get(b) or ''} | " + " | ".join(" ".join(cell[(b, a)]) or "-" for a in s) + " |")
@@ -132,7 +144,7 @@ def write_report(bench_id: str, path: Path, rows: list[dict] | None = None) -> P
         rs = [r for r in rows if r["difficulty"] == d]
         if rs:
             lines.append(f"| {d} | " + " | ".join(
-                f"{sum(1 for r in rs if r['arch'] == a and r['objective_pass'])}/{sum(1 for r in rs if r['arch'] == a)}"
+                f"{sum(1 for r in rs if label(r) == a and r['objective_pass'])}/{sum(1 for r in rs if label(r) == a)}"
                 for a in s) + " |")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

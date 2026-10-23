@@ -3,6 +3,22 @@
 > Written so sections can be lifted into the final report. Every claim below is backed by
 > code (file references) or by run data (`runs.db`, `traces/*.jsonl`, `benchmarks/results/*`).
 
+## 0. Course requirements → where they are met
+
+| # | Requirement | Implementation |
+|---|---|---|
+| 1 | Context sharing via state; compare messaging architectures; **Blackboard is a must** | SQLite Blackboard of typed envelopes (`codefix/blackboard/`); three messaging architectures behind one switch, benchmarked on the same bugs (§2, §8) |
+| 2 | ≥ 2 external tools via **MCP** | one MCP server, 16 tools: code search (ripgrep + vectors), file reader, stack-trace parser, linter, test runner, git, RAG (ChromaDB) (§3) |
+| 3 | Structured output with **Pydantic** | Every agent output and every message is a Pydantic model; final output is JSON + unified diff + Markdown reports (§3) |
+| 4 | Agentic design patterns, evaluated against others | Manager–worker (hierarchical), ReAct, Reflection (Reviewer agent), Human-in-the-loop, Guardrails; compared with sequential & peer-to-peer orchestration and with few-shot prompting (§5) |
+| 5 | Monitoring & logging via **callbacks** | ADK `before/after_agent/model/tool` + `on_tool_error` callbacks, CrewAI event-bus listener + `step_callback`/`task_callback` (`codefix/observability/callbacks.py`) (§7) |
+| 6 | **A2A** agent-to-agent, interoperable frameworks | ADK agents call the CrewAI agents over the A2A protocol (official `a2a-sdk`, JSON-RPC), with a public agent card (§4) |
+| 7 | **Only CrewAI and ADK** | Orchestration and LLM agents in Google ADK, worker agents in CrewAI; no other agent framework is installed or imported (`tests/test_frameworks.py::test_only_crewai_and_adk_agent_frameworks`) |
+| 8 | **Guardrails**; prompt variants | Input screening (prompt injection, abuse), tool-output type checks, untrusted-content flags, patch-safety task guardrail; prompt variants `react` / `fewshot` / `react-reflect` × 4 personas (§6) |
+| 9 | Observability (auditability, provenance) | JSONL trace per run, `runs.db`, Blackboard snapshots, A2A message ids, RAG citations validated against retrieved ids, dashboard (§7) |
+| 10 | End-to-end evaluation, cost & time over many runs, prompt variance | `codefix bench` over architectures × variants × personas; objective tests + LLM judge; cost, tokens, time per configuration and paid-price estimates (§8) |
+| 11 | Deploy on a cloud platform | Dockerfile + Google Cloud Run (`deploy/deploy_cloudrun.ps1`) (§9) |
+
 ## 1. Problem and user story
 
 A developer pastes a bug report (optionally a stack trace) and points at a Git repo. The
@@ -10,35 +26,31 @@ system **locates** the defect, **explains** the root cause, **writes** a patch, 
 with the project's own test suite, and **offers** a Pull Request. A failing verification does
 not restart the job: the failure log is sent back to the agent that wrote the patch.
 
-## 2. Architecture: hierarchical multi-agent (default)
+## 2. Architecture: hierarchical multi-agent across two frameworks
 
-![compiled LangGraph](graph.png)
+![hierarchical architecture](graph.png)
 
-The graph above is exported straight from the compiled LangGraph (`codefix graph`), so the
-diagram cannot drift from the code (`codefix/graph/hierarchical.py`).
+| Agent | Framework | Role | Model | Output |
+|---|---|---|---|---|
+| Manager | **Google ADK** custom agent (`ManagerAgent`) | routing + state evaluation; each decision is a one-shot ADK `LlmAgent` | `manager` role (small, fast) | `DispatchRef` envelopes, `Escalation` |
+| Diagnoser | **Google ADK** `LlmAgent` with MCP tools | explicit ReAct (or few-shot) over report, trace, repo | `diagnoser` role | `Diagnosis` |
+| Fixer (+ Reviewer) | **CrewAI** `Agent` + `Task` (guardrailed), in a `Crew` | patch generation; optional Reflection reviewer | `fixer` / `reviewer` roles | `Patch` (unified diff + rationale) |
+| Tester | **CrewAI** `Flow` step | isolated apply → lint → test suite | deterministic (no LLM) | `TestReport` |
+| PR agent | **CrewAI** `Flow` step | branch + commit; push + PR after human confirmation | deterministic | `PRResult` |
 
-| Node | Role | Model | Output |
-|---|---|---|---|
-| `manager` | Orchestrator: routing + state evaluation only | `claude-haiku-5-5` | `DispatchRef` envelopes, `Escalation` |
-| `diagnoser` | Explicit ReAct over report, trace, repo | `claude-opus-5-5` | `Diagnosis` |
-| `fixer` | Patch generation from the diagnosis | `claude-sonnet-5-5` | `Patch` (unified diff + rationale) |
-| `tester` | Isolated apply → lint → test suite | deterministic (no LLM) | `TestReport` |
-| `pr_prepare` / `open_pr` | Branch + commit; push + PR after human confirmation | deterministic | `PRResult` |
-| `escalate` | Hand-off note to a human | manager model | `Escalation` |
+The ADK side and the CrewAI side never import each other's agent code: they talk **A2A**
+(§4). Both frameworks reach models through small adapters onto one LLM layer (`codefix/llm.py`:
+Gemini or Claude, plus an offline oracle mock), so every model call is measured identically
+(`codefix/adk_side/model.py` is an ADK `BaseLlm`; `codefix/crew_side/llm.py` is a CrewAI
+`BaseLLM`).
 
 **Control flow (Manager):** `diagnosis_ready → fixer` (or one re-diagnosis if the diagnosis is
-weak) → `tester` → on `passed` → `pr_prepare` → **interrupt** (human gate) → `open_pr`. On
-failure → `fixer` again **with the TestReport attached by reference**, at most `max_attempts`
-(default 3, `config/models.yaml` / `--max-attempts` / UI selector), then `escalate` with a
-written summary of everything tried.
-
-**The loop is a real cycle in the compiled graph** (`manager ⇄ fixer`, `manager ⇄ tester`)
-expressed with `add_conditional_edges`, not a Python `while`. It is bounded in code, not by
-the model: the Manager node checks `attempts >= max_attempts` before consulting its LLM, and
-the LLM may only choose among the *legal* transitions for that decision point
-(`codefix/agents/manager.py`). An invalid or failed routing answer falls back to the
-deterministic policy, so a bad model output cannot create an unbounded loop
-(`tests/test_graph_retry.py::test_manager_llm_invalid_decision_falls_back`).
+weak) → `tester` → on `passed` → `pr_prepare` → **human gate** → `open_pr`. On failure →
+`fixer` again **with the TestReport attached by reference**, at most `max_attempts`
+(default 3), then `escalate` with a written summary of everything tried. Bounds are enforced in
+code: the Manager checks `attempts >= max_attempts` before consulting its LLM, and the LLM may
+only choose among the *legal* transitions; an invalid or failed answer falls back to the
+deterministic policy (`tests/test_graph_retry.py::test_manager_llm_invalid_decision_falls_back`).
 
 ### Why hierarchical rather than sequential or event-driven?
 
@@ -47,29 +59,33 @@ deterministic policy, so a bad model output cannot create an unbounded loop
 | Failure handling | restart from scratch; re-pays the diagnosis and loses the failure log | each peer must know the retry rules; no global view | one place decides; retries only the failed stage, **with** the failure evidence |
 | Bounded execution | trivially bounded but wasteful | needs distributed counters/timeouts | single attempt counter on the Blackboard, checked by the Manager |
 | Observability | linear log | causality spread across peers | every hop is Manager ⇄ worker: a star-shaped, auditable message log |
-| Cost of coordination | none | none | one cheap Haiku call per decision point (measured in the dashboard as "Manager (LLM time)") |
-| Extensibility | reorder code | rewire peers | add a node + a Manager transition |
+| Cost of coordination | none | none | one cheap routing call per decision point |
+| Extensibility | reorder code | rewire peers | add a worker + a Manager transition |
 
-Both alternatives are implemented behind the same interface so the claim is testable, not
-rhetorical (`--arch sequential|p2p`, `codefix bench --arch all`):
+All three are implemented (`codefix/adk_side/pipelines.py`, `--arch`):
 
-- **sequential** (`codefix/graph/sequential.py`): Diagnose → Fix → Test → PR; any failure
-  restarts the whole run from diagnosis, carrying nothing over.
-- **p2p** (`codefix/graph/p2p.py`): Diagnoser → Fixer → Tester; on failure the Tester hands
-  its full TestReport straight back to the Fixer. No Manager, no Blackboard reads; each peer
-  routes with a fixed local rule (no re-diagnosis, no early escalation).
+- **hierarchical**: `ManagerAgent` (ADK custom agent) as above.
+- **sequential** ([diagram](graph_sequential.png)): ADK workflow agents —
+  `LoopAgent(max_attempts)[SequentialAgent[diagnose → fix (A2A) → test (A2A) → gate]]`; any
+  failure restarts the whole attempt from diagnosis, carrying nothing over (inline hand-off in
+  ADK session state).
+- **p2p** ([diagram](graph_p2p.png)): the ADK Diagnoser hands its Diagnosis inline over A2A to
+  the CrewAI `PeerRepairFlow`, where Fixer and Tester pass the patch and the full TestReport
+  straight to each other with a fixed local rule. No Manager, no Blackboard reads.
 
-## 3. Messaging: MCP for tools, Blackboard for state
+## 3. Messaging: Blackboard for state, MCP for tools
 
 ### Blackboard (`codefix/blackboard/`)
 
 A SQLite-backed (`runs.db`) single source of truth keyed by `task_id`: bug report, current
 `Diagnosis`, active `Patch`, latest `TestReport`, attempt counter, escalation/PR results and
 the **append-only message log**. In hierarchical mode agents read and write *only* through
-it. `Blackboard.snapshot(task_id)` dumps the complete pipeline state at any instant; it is
-the observability audit point (`codefix trace <id> --json`, "state dump" in the UI).
+it. `Blackboard.snapshot(task_id)` dumps the complete pipeline state at any instant; it is the
+observability audit point (`codefix trace <id> --json`, "state dump" in the UI). Because the
+Blackboard holds the complete state, a run paused at the human PR gate resumes from it
+directly — no framework checkpoint is needed (`runner.resolve_pr`).
 
-Every inter-agent exchange is a typed, validated envelope (`codefix/blackboard/schemas.py`):
+Every inter-agent exchange is a typed, validated Pydantic envelope (`codefix/blackboard/schemas.py`):
 
 ```python
 class Envelope(BaseModel):
@@ -83,123 +99,134 @@ class Envelope(BaseModel):
     latency_ms: int | None     # filled on completion: time since the hand-off to this agent
 ```
 
-Payloads are strict (`extra="forbid"`, bounded floats) and re-validated at the Blackboard
-boundary (`tests/test_envelope.py`).
+**Bounded message size.** A Manager dispatch references prior artifacts **by `task_id` +
+artifact id** (`DispatchRef.artifact_refs`), never by re-sending their content — and the A2A
+message to the CrewAI side carries exactly that reference set. A third-attempt dispatch is the
+same size as the first, while the P2P hand-off carries the full TestReport inline (measured as
+"Mean envelope size (bytes)" in the benchmark report).
 
-**Design point: bounded message size.** A Manager → agent dispatch references prior
-artifacts **by `task_id` + artifact id** (`DispatchRef.artifact_refs`), never by re-sending
-their content. A third-attempt dispatch is the same size as the first, while the P2P
-hand-off carries the full TestReport inline. The benchmark report measures this as "Mean
-envelope size (bytes)" per architecture.
-
-### Why MCP + Blackboard rather than direct P2P hand-offs?
-
-- **Uniform tool access.** All tools sit behind one MCP server (`mcp_server/`, stdio
-  transport, `MCPServer` = the mcp 2.x name for FastMCP). Any agent, backed by any model,
-  calls `code_search`, `read_file`, `run_tests`, … the same way. The LangGraph side binds
-  them as LangChain `StructuredTool`s through a thin client (`codefix/mcp_client.py`). Swapping
-  a model never touches tool code.
-- **Safety in one place.** Path sandboxing, the secrets blocklist, workspace isolation, the
-  timeouts and the PR confirmation guard live in the server, so *no* agent can bypass them.
-- **Decoupled state.** Peers never need each other's memory; anything an agent needs is on
-  the Blackboard. That is what makes re-dispatching a single stage (Fixer only) possible, and
-  what makes a run resumable after the human PR gate (LangGraph `SqliteSaver` checkpoint).
-- **Auditability.** The Blackboard log is total and ordered; P2P spreads causality across
-  peers.
-
-### MCP tools
+### MCP tools (`mcp_server/`, FastMCP over stdio)
 
 | Tool | Notes |
 |---|---|
-| `code_search(query, k)` | hybrid: ripgrep literal + vector search over AST chunks, fused with reciprocal-rank fusion |
-| `read_file(path, start, end)`, `list_tree(path)` | sandboxed to the repo root, blocklist enforced |
-| `parse_stacktrace(text)` | Python / pytest / JS frames, mapped to repo files (innermost repo frame) |
-| `static_analysis(paths)` | ruff (`E9,F`) or eslint, falling back to `node --check`; only *new* error-class findings gate |
-| `run_tests(workspace, selector?)` | pytest / jest / node:test auto-detected; subprocess, hard timeout, JUnit-parsed |
-| `create_workspace`, `apply_patch(diff)`, `git_branch`, `git_commit` | per-attempt isolated clone |
-| `open_pull_request` | refuses unless `confirmed=true` and the branch is `codefix/*`; never the default branch |
-| `rag_retrieve(query, k, collection)`, `index_repo`, `record_fix` | RAG over code / bugs / docs |
+| `code_search(query, k)` | hybrid: ripgrep literal + vector search over AST chunks, reciprocal-rank fusion |
+| `read_file`, `list_tree` | sandboxed to the repo root, secrets blocklist enforced |
+| `parse_stacktrace(text)` | Python / pytest / JS frames, mapped to repo files |
+| `static_analysis(paths)` | ruff (`E9,F`) or eslint; only *new* error-class findings gate |
+| `run_tests(workspace)` | pytest / jest / node:test auto-detected; subprocess, hard timeout, JUnit-parsed |
+| `create_workspace`, `apply_patch`, `git_branch`, `git_commit` | per-attempt isolated clone |
+| `open_pull_request` | refuses unless `confirmed=true` and the branch is `codefix/*` |
+| `rag_retrieve`, `index_repo`, `record_fix` | RAG over code / past fixes / docs (ChromaDB) |
 
-## 4. Model selection (task–model fit)
+On the ADK side every MCP tool becomes a native ADK `BaseTool` whose declaration is the
+server's own JSON schema (`codefix/adk_side/tools.py`). Safety (path sandbox, blocklist,
+timeouts, PR guard) lives in the server, so no agent in either framework can bypass it.
 
-| Agent | Model | Why |
+## 4. A2A: ADK ⇄ CrewAI interoperability
+
+The CrewAI worker agents are published as an **A2A agent** (`codefix/crew_side/a2a_server.py`,
+official `a2a-sdk`, JSON-RPC binding) with skills `fix`, `test`, `pr_prepare`, `p2p_repair`
+and an agent card at `/.well-known/agent-card.json`. The ADK side is the A2A client
+(`codefix/a2a_link.py`): each request is one A2A message with a single data part
+`{skill, task_id, payload}`; the reply is a data part with the result ids.
+
+- Locally (CLI, tests, benchmark) the A2A app is reached in-process through httpx's ASGI
+  transport — real A2A JSON-RPC messages, no extra server.
+- In the deployed web app it is mounted at `/a2a/crew/`; `codefix crew-serve` runs it as a
+  standalone service and `CODEFIX_CREW_A2A_URL` points the ADK side at it over HTTP.
+- Every exchange is traced (`a2a_request` / `a2a_response`: skill, message id, transport,
+  bytes, latency, ok) — the provenance record for work done across the framework boundary.
+
+## 5. Agentic design patterns, prompting and RAG
+
+| Pattern | Where | Compared against |
 |---|---|---|
-| Manager | `claude-haiku-5-5` (effort low) | chooses among 2–3 legal transitions from a compact state summary. Frontier capability is wasted here, and it runs at every decision point, so cost and latency dominate |
-| Diagnoser | `claude-opus-5-5` (effort high, thinking summaries kept) | multi-step reasoning over traces, logs and code, where localisation errors are the most expensive downstream |
-| Fixer | `claude-sonnet-5-5` (effort medium) | code editing once the defect is localised; strong coding at half Opus's price |
-| Judge | `claude-fable-5-1` | **must differ from both generators** to avoid self-preference bias (enforced in `codefix/config.py`) |
+| Manager–worker (hierarchical) | `ManagerAgent` | sequential (ADK LoopAgent), peer-to-peer (CrewAI Flow) |
+| ReAct | ADK Diagnoser, tool calls executed by ADK | few-shot one-step diagnosis (`--variant fewshot`) |
+| Reflection | CrewAI Reviewer agent critiques/revises the Fixer's patch | no reflection (`react` vs `react-reflect`) |
+| Self-correction loop | failed TestReport → Fixer, bounded | sequential restart without feedback |
+| Human-in-the-loop | PR only after explicit confirmation | — |
+| Guardrails | §6 | — |
 
-Every role is swappable in `config/models.yaml` with no code change. Every call logs the
-requested model, the served model (refusal fallbacks are on for Opus/Sonnet/Fable),
-input/output/cache tokens, USD cost and latency (`llm_calls` table, `llm_call` trace
-events, dashboard "Spend by agent / model"). To produce the Phase 1 comparison table,
-re-run `codefix bench` with a role swapped in the YAML and compare the two reports.
+**Diagnoser: explicit ReAct on ADK** (`codefix/agents/diagnoser.py`, `codefix/adk_side/model.py`).
+Each turn the model returns `{thought, action, action_input, final_answer}`; the ADK model
+adapter turns the action into an ADK function call, ADK executes it through the tool callbacks
+and guardrails, and the response comes back as the ReAct "Observation". Iterations are capped
+(8); at the cap the model is forced to answer, and failing that a best-effort diagnosis
+(`degraded=true`) is assembled from the evidence. The transcript is saved verbatim
+(`react_step` events, `traces/<task_id>.react.md`).
 
-## 5. Prompting and RAG
+**Prompt variants** (`codefix/prompts.py`): `react` (default), `fewshot` (retrieved context +
+full text of the likely files + two worked examples, one step, no tool loop),
+`react-reflect` (ReAct + Reviewer). **Personas**: `default`, `senior`, `novice`, `security`,
+prepended to the Diagnoser, Fixer and Reviewer system prompts. Both are stored in each run's
+meta and are dimensions of the benchmark.
 
-**Diagnoser: explicit ReAct** (`codefix/agents/diagnoser.py`). Each turn is a structured
-output `{thought, action, action_input, final_answer}`; the action is executed through MCP
-and the observation appended. The transcript is persisted verbatim as `react_step` trace
-events and as `traces/<task_id>.react.md`. Iterations are capped (8); at the cap the model is
-forced to answer, and failing that a best-effort diagnosis (`degraded=true`, reduced
-confidence) is assembled from the gathered evidence. The Manager treats a degraded or
-low-confidence diagnosis as weak and may request one re-diagnosis.
+**Fixer: CrewAI Task with a guardrail** (`codefix/agents/fixer.py`). The model emits exact
+`find/replace` edits; the Task guardrail derives the unified diff deterministically
+(`patching.py`), rejects test edits and unsafe code, and on failure sends the reason back for
+one repair turn.
 
-**Fixer: anchored edits → deterministic diff.** The model emits exact `find/replace` edits
-and the unified diff is derived with `difflib` (`codefix/agents/patching.py`). LLM-written
-hunks with hand-computed line numbers are the most common cause of "patch does not apply";
-deriving the diff removes that failure class while still storing a standard unified diff.
-Patches touching tests are rejected (`allow_test_edits: false`).
+**RAG** (`codefix/rag/`): ChromaDB + `all-MiniLM-L6-v2`, three collections per repo — code
+(AST/function chunks with file+line metadata), bugs (past accepted fixes from run history), docs.
+Retrieved chunk ids are shown to the model and **citations are validated** against the ids
+actually retrieved; unknown ids are dropped and logged (`citation_dropped`).
 
-**RAG** (`codefix/rag/`): ChromaDB + `sentence-transformers/all-MiniLM-L6-v2` (no second API
-key; the embedder sits behind an interface, with a hashing fallback). Three collections per repo:
-(a) **code**: AST/function-level chunks with file and line metadata (Python `ast`;
-brace-matched JS/TS); (b) **bugs**: past bugs plus their accepted fixes from this project's
-own run history (written when a fix passes); (c) **docs**: README and `docs/`. Indexing is
-incremental on file mtime (`codefix index <repo>`). Retrieved chunk ids are shown to the
-model, and **citations are validated** against the ids actually retrieved; unknown ids are
-dropped and logged as `citation_dropped`. The UI renders citations as chips that open the
-cited source lines.
+**Model selection** (`config/models.yaml`, swappable per role): Manager and Judge on a small,
+fast model; Diagnoser and Fixer on a stronger model. The Judge **must differ** from the
+generating models (self-preference bias; enforced in `codefix/config.py`).
 
-## 6. Safety
+## 6. Guardrails and safety (`codefix/guardrails.py`)
 
-- **Never mutates the target repo.** Each attempt runs in `git clone --no-hardlinks` under
-  `.codefix/sandbox/<task>-a<n>` (uncommitted tracked changes are overlaid). Failed workspaces
-  are discarded.
-- **No shell interpolation.** Every subprocess is an argv list (`sandbox.run` refuses strings);
-  tests run with a hard timeout, captured output, and our credentials stripped from the env.
-- **Paths:** anything resolving outside the repo root is refused. `.env*`, `.git/`, CI
-  workflows, key material and `*secrets*` are blocklisted for read *and* patch.
-- **PRs:** only after explicit human confirmation (UI modal with a review checkbox, or the
-  CLI prompt), only on `codefix/<task_id>`, never the default branch. That is enforced three
-  times: in the LangGraph interrupt, in the PR agent, and in the MCP tool.
+| Boundary | Guardrail | Mechanism |
+|---|---|---|
+| User input | prompt-injection patterns, abusive/threatening language, empty/oversized reports | `screen_user_input` before any agent runs; blocked runs end with outcome `blocked`, no model is called |
+| Tool output | type check against Pydantic schemas per tool; repo text that addresses the model is wrapped as untrusted data | ADK `after_tool_callback` |
+| Tool use | per-agent tool allow-list; argument shape check | ADK `before_tool_callback` |
+| Agent output | patch must apply, must not touch tests, must not add shell/eval/file-deletion/network/secret access | CrewAI Task guardrail (`guardrail=`), retried with feedback |
+| Repository | never mutated: every attempt runs in its own `git clone`; paths outside the repo refused; `.env`, keys, CI secrets blocklisted | MCP server |
+| PR | only after explicit human confirmation, only on `codefix/<task_id>`, never the default branch — checked in the runner, the PR agent and the MCP tool | |
 
-## 7. Observability
+Every guardrail decision is a `GuardrailResult` and a `guardrail` trace event.
 
-- `traces/<task_id>.jsonl`: every envelope, tool call, LLM call (model, tokens, cost),
-  ReAct step, Manager decision, RAG retrieval, test output, and the `delta_ms` between events.
-- `runs.db`: `runs`, `messages`, `llm_calls`, `tool_calls`, `evaluations` (+ `artifacts`).
-- LangSmith export: set `LANGCHAIN_TRACING_V2=true` (LangGraph spans + wrapped Anthropic client).
-- Dashboard: run list, per-run Gantt timeline per agent, per-agent mean latency
-  (bottleneck flagged), attempt distribution, failure-stage breakdown, cost per run, judge
-  accuracy, plus an **accuracy weak point** panel separating *localisation* (did the
-  Diagnoser name the right file?) from *repair given correct localisation* (did the Fixer's
-  patch pass?).
+## 7. Monitoring, logging and observability
 
-## 8. Evaluation
+- **Framework callbacks** (`codefix/observability/callbacks.py`): ADK `before/after_agent`,
+  `before/after_model`, `before/after_tool`, `on_tool_error`; CrewAI event-bus listener (crew,
+  task, LLM, flow-method and guardrail events) plus crew `step_callback`/`task_callback`.
+  Each hook writes a `callback` event with framework, hook, agent and latency.
+- `traces/<task_id>.jsonl`: every envelope, A2A exchange, tool call, LLM call (model, tokens,
+  cost), ReAct step, Manager decision, guardrail decision, RAG retrieval, test output, callback,
+  and the `delta_ms` between events.
+- `runs.db`: `runs`, `messages`, `llm_calls`, `tool_calls`, `evaluations`, `artifacts`.
+- Web UI: live run view (A2A exchanges, guardrails, callbacks per run), run list, dashboard
+  (per-agent latency with the bottleneck flagged, attempts, failure stages, cost, judge accuracy).
+
+## 8. Evaluation (`codefix bench`)
 
 `benchmarks/bugset/`: two sample repos (Python `pyshop`, 46 tests; JS `textkit`, node:test)
-and 16 reproducible injected bugs (`bugs.yaml`) across easy/medium/hard, each with a report,
-its failing test and the known-good fix (`codefix bench --verify-bugset` proves each bug fails
-when injected and passes when fixed). 16 bugs × 3 architectures = **48 runs** per benchmark.
+and 16 reproducible injected bugs (easy/medium/hard); `codefix bench --verify-bugset` proves
+each bug fails when injected and passes when fixed.
 
-- **Objective signal:** the final patch is re-applied to a *fresh* clone and the
-  previously-failing test plus the full suite are run, independently of the Tester.
-- **LLM-as-judge:** `{verdict: pass|fail|partial, reasoning, score}` from the judge model,
-  which sees the report, original source and diff but **not** the test results, so
-  judge-vs-tests agreement measures the judge, not an echo.
-- Each run gets a freshly materialised repo, so no architecture can retrieve another
-  architecture's accepted fix for the same bug from the `bugs` collection.
-- Output: `benchmarks/results/<bench_id>/runs.csv` + `report.md` (resolve rate, judge pass
-  rate, judge accuracy, attempts, retries, escalations, per-agent latency, bottleneck, cost,
-  tokens, envelope size, failure stages, per-bug and per-difficulty matrices).
+`codefix bench --arch all --variants react,fewshot,react-reflect --personas default,senior`
+runs every bug under every configuration. Each run is graded twice:
+
+- **Objective:** the final patch is re-applied to a fresh clone and the previously-failing test
+  plus the full suite are run, independently of the Tester.
+- **LLM-as-judge:** `{verdict, reasoning, score}` from the judge model, which sees the report,
+  source and diff but **not** the test results, so judge-vs-tests agreement measures the judge.
+
+The report (`benchmarks/results/<id>/report.md` + `runs.csv`) has, per configuration: resolve
+rate, judge pass rate and accuracy, attempts, retries, escalations, per-agent latency and
+bottleneck, tokens, cost, envelope size, failure stages, per-bug/per-difficulty matrices,
+variant and persona comparisons, and a **cost & running-time estimate** (total time, tokens,
+billed cost, and what the same volume would cost at paid list prices).
+
+## 9. Deployment (Google Cloud Run)
+
+One container (`Dockerfile`): FastAPI web app + ADK orchestration + CrewAI A2A service
+(`/a2a/crew/`) + MCP tool server subprocess, with the embedding model baked in.
+`deploy/deploy_cloudrun.ps1 -Project <id>` builds it with Cloud Build, stores `GEMINI_API_KEY`
+in Secret Manager, deploys to Cloud Run (private by default; `-Public` to open it) and sets
+`CODEFIX_PUBLIC_URL` so the A2A agent card advertises the real URL. Run data on Cloud Run lives
+in `/tmp` and does not survive instance restarts.

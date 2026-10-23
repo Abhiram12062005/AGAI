@@ -100,6 +100,12 @@ class FixerOutput(BaseModel):
     confidence: float
 
 
+class ReviewOutput(BaseModel):
+    approved: bool = Field(description="True when the patch fixes the root cause minimally and safely")
+    issues: list[str] = Field(description="Problems found (empty when approved)")
+    revised: FixerOutput | None = Field(description="Corrected Fixer output when not approved, else null")
+
+
 class ManagerDecision(BaseModel):
     decision: str = Field(description="One of the allowed decisions")
     reason: str

@@ -1,4 +1,4 @@
-"""codefix CLI: fix | demo | index | bench | trace | runs | pr | serve | graph."""
+"""codefix CLI: fix | demo | index | bench | trace | runs | pr | serve | crew-serve | graph."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ app = typer.Typer(add_completion=False, help="CodeFix AI — autonomous multi-ag
 con = Console()
 
 ARCH_HELP = "hierarchical (default) | sequential | p2p"
+VARIANT_HELP = "Prompt variant: react (default) | fewshot | react-reflect"
+PERSONA_HELP = "Persona: default | senior | novice | security"
 AGENT_STYLE = {"manager": "magenta", "diagnoser": "cyan", "fixer": "yellow", "tester": "green", "pr": "blue",
                "system": "dim", "human": "bold white"}
 
@@ -62,6 +64,16 @@ def _print_event(ev: dict) -> None:
     elif t == "llm_call":
         con.print(f"[dim]          llm {ev['agent']} {ev.get('served_model') or ev['model']} "
                   f"in={ev['input_tokens']} out={ev['output_tokens']} ${ev['cost_usd']:.4f} {ev['latency_ms']}ms[/]")
+    elif t == "a2a_request":
+        con.print(f"[blue]       A2A[/] adk → codefix-crew [bold]{ev['skill']}[/] [dim]({ev['transport']}, "
+                  f"{ev['bytes']} bytes)[/]")
+    elif t == "a2a_response" and not ev.get("ok"):
+        con.print(f"[red]       A2A {ev['skill']} failed: {ev.get('error')}[/]")
+    elif t == "guardrail" and (not ev.get("allowed") or ev.get("category") != "ok"):
+        con.print(f"[red]  guardrail[/] {ev.get('stage')}: [bold]{ev.get('category')}[/] "
+                  f"[dim]{'; '.join(ev.get('reasons', []))[:160]}[/]")
+    elif t == "reflection":
+        con.print(f"[yellow]  reviewer[/] approved={ev.get('approved')} [dim]{'; '.join(ev.get('issues') or [])[:140]}[/]")
     elif t in ("run_error",):
         con.print(f"[red]run error: {ev['error']}[/]")
     elif t == "index":
@@ -135,6 +147,8 @@ def fix(bug_report: str = typer.Argument(..., help="Bug report text (or @file.tx
         max_attempts: int | None = typer.Option(None, help="Fixer attempts before escalation (default from YAML)"),
         trace: Path | None = typer.Option(None, "--stack-trace", "-t", help="File containing a stack trace"),
         llm: str = typer.Option("live", help="live | mock (mock only for bugset repos; use `codefix demo`)"),
+        variant: str | None = typer.Option(None, help=VARIANT_HELP),
+        persona: str | None = typer.Option(None, help=PERSONA_HELP),
         yes_pr: bool = typer.Option(False, "--yes-pr", help="Skip the PR confirmation prompt (still explicit)")):
     """Locate, explain, patch and verify a bug; then offer to open a PR."""
     if bug_report.startswith("@"):
@@ -142,16 +156,29 @@ def fix(bug_report: str = typer.Argument(..., help="Bug report text (or @file.tx
     stack = trace.read_text(encoding="utf-8") if trace else ""
     if llm == "mock":
         raise typer.BadParameter("mock mode needs ground truth: use `codefix demo <bug-id> --llm mock`")
-    snap = _execute(bug_report, repo, arch, max_attempts, llm, stack)
+    snap = _execute(bug_report, repo, arch, max_attempts, llm, stack, extra=_variant_extra(variant, persona))
     _show_result(snap)
     _offer_pr(snap, yes_pr)
+
+
+def _variant_extra(variant: str | None, persona: str | None) -> dict:
+    from codefix import prompts
+
+    extra = {k: v for k, v in (("variant", variant), ("persona", persona)) if v}
+    try:
+        prompts.check(extra.get("variant", "react"), extra.get("persona", "default"))
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    return extra
 
 
 @app.command()
 def demo(bug_id: str = typer.Argument("py05-region-case", help="Bug id from benchmarks/bugset/bugs.yaml"),
          arch: str = typer.Option("hierarchical", help=ARCH_HELP),
-         llm: str = typer.Option("live", help="live (Anthropic API) | mock (offline oracle, shows a retry)"),
-         max_attempts: int | None = typer.Option(None)):
+         llm: str = typer.Option("live", help="live (Gemini API) | mock (offline oracle, shows a retry)"),
+         max_attempts: int | None = typer.Option(None),
+         variant: str | None = typer.Option(None, help=VARIANT_HELP),
+         persona: str | None = typer.Option(None, help=PERSONA_HELP)):
     """Materialise a seeded bug into a fresh repo and fix it end-to-end (the live-demo path)."""
     from codefix.eval.bugset import failing_output, load_bugs, materialize, trace_text
     from codefix.eval.oracle import OracleMock
@@ -165,7 +192,7 @@ def demo(bug_id: str = typer.Argument("py05-region-case", help="Bug id from benc
     con.print(Panel(f"{bug.report}\n\n[dim]repo: {repo}[/]" + (f"\n[dim]failing test output attached ({len(stack)} chars)[/]" if stack else ""),
                     title=f"Bug report · {bug.id} · {arch} · llm={llm}"))
     snap = _execute(bug.report, repo, arch, max_attempts, llm, stack,
-                    handler=OracleMock(bug) if llm == "mock" else None)
+                    handler=OracleMock(bug) if llm == "mock" else None, extra=_variant_extra(variant, persona))
     _show_result(snap)
     _offer_pr(snap, False)
 
@@ -189,6 +216,8 @@ def bench(arch: str = typer.Option("all", help="all | comma list of " + ARCH_HEL
           llm: str = typer.Option("live", help="live | mock"),
           judge: bool = typer.Option(True, help="Run the LLM judge"),
           max_attempts: int | None = typer.Option(None),
+          variants: str = typer.Option("react", help="Comma list of prompt variants: react,fewshot,react-reflect"),
+          personas: str = typer.Option("default", help="Comma list of personas: default,senior,novice,security"),
           verify_bugset: bool = typer.Option(False, "--verify-bugset", help="Only check every bug is reproducible")):
     """Benchmark architectures on the seeded bug set -> CSV + markdown report."""
     from codefix.eval.bugset import load_bugs, verify
@@ -208,8 +237,12 @@ def bench(arch: str = typer.Option("all", help="all | comma list of " + ARCH_HEL
     from codefix.graph.runner import ARCHS
 
     archs = list(ARCHS) if arch == "all" else [a.strip() for a in arch.split(",")]
+    vs, ps = [v.strip() for v in variants.split(",")], [p.strip() for p in personas.split(",")]
+    for v in vs:
+        for p in ps:
+            _variant_extra(v, p)
     out = run_bench(archs, runs=runs, bug_ids=bugs.split(",") if bugs else None, llm_mode=llm, judge=judge,
-                    max_attempts=max_attempts, progress=con.print)
+                    max_attempts=max_attempts, variants=vs, personas=ps, progress=con.print)
     con.print(Path(out["report"]).read_text(encoding="utf-8"))
 
 
@@ -280,9 +313,21 @@ def serve(host: str = "127.0.0.1", port: int = 8000):
     uvicorn.run("web.api.app:app", host=host, port=port, log_level="warning")
 
 
+@app.command("crew-serve")
+def crew_serve(host: str = "127.0.0.1", port: int = 8100):
+    """Run the CrewAI worker agents as a standalone A2A service (point CODEFIX_CREW_A2A_URL at it)."""
+    import uvicorn
+
+    from codefix.crew_side.a2a_server import build_app
+
+    url = f"http://{host}:{port}/"
+    con.print(f"CodeFix CrewAI A2A service → [bold]{url}[/] (agent card: {url}.well-known/agent-card.json)")
+    uvicorn.run(build_app(url), host=host, port=port, log_level="warning")
+
+
 @app.command()
 def graph(out: Path = typer.Option(config.ROOT / "docs")):
-    """Export the compiled LangGraph diagrams (docs/graph.png + per-architecture)."""
+    """Export the architecture diagrams (docs/graph.png + per-architecture, Mermaid source)."""
     from codefix.graph.runner import export_graph_images
 
     for arch, p in export_graph_images(out).items():
@@ -290,7 +335,14 @@ def graph(out: Path = typer.Option(config.ROOT / "docs")):
 
 
 def main():  # pragma: no cover
+    import sys
+
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     app()
 
 
